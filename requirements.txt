@@ -1,0 +1,21 @@
+# Core async & server
+aiohttp>=3.9.0
+websockets>=12.0
+aiortc>=1.9.0
+
+# Audio & media
+av>=10.0.0
+sounddevice>=0.4.6
+
+# GUI
+# Tkinter идёт в стандартной библиотеке (в requirements не нужен)
+
+# Crypto & Security
+cryptography>=42.0.0
+
+# Utils
+numpy>=1.26.0
+pillow>=10.0.0
+
+
+
