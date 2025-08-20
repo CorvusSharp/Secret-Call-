@@ -14,7 +14,8 @@
     <input id="name" type="text" placeholder="Ваше имя" />
   </div>
   <div class="row">
-    <button id="btn">Подключиться</button>
+    <button id="btn" class="primary">Подключиться</button>
+    <button id="bye" class="danger" disabled>Отключиться</button>
     <span id="st" class="mono"></span>
   </div>
   <div class="row">
@@ -41,6 +42,7 @@
   const logEl = document.getElementById('log');
   const statusEl = document.getElementById('st');
   const btn = document.getElementById('btn');
+  const bye = document.getElementById('bye');
   const audioEl = document.getElementById('remote');
   const nameEl = document.getElementById('name');
   const micVolEl = document.getElementById('micVol');
@@ -50,6 +52,8 @@
 
   let micGain;
   let localTrack;
+  let pc;
+  let ws;
 
   const opts = () => ({
     audio: {
@@ -80,10 +84,11 @@
 
   async function connect() {
     btn.disabled = true;
+    bye.disabled = false;
     say('Инициализация…', 'mono');
 
-    const pc = new RTCPeerConnection({iceServers});
-    const ws = new WebSocket(wsURL);
+    pc = new RTCPeerConnection({iceServers});
+    ws = new WebSocket(wsURL);
 
     pc.onicecandidate = ev => {
       if (!ev.candidate) {
@@ -131,7 +136,11 @@
       if (n) ws.send(JSON.stringify({type:'name', name: n}));
     };
     ws.onerror = () => say('[WS] error', 'err');
-    ws.onclose = () => say('[WS] closed', 'warn');
+    ws.onclose = () => {
+      say('[WS] closed', 'warn');
+      btn.disabled = false;
+      bye.disabled = true;
+    };
 
     ws.onmessage = async (ev) => {
       const data = JSON.parse(ev.data);
@@ -186,11 +195,20 @@
     remoteMuteEl.addEventListener('change', updRemote);
     updRemote();
   }
+  function disconnect() {
+    if (pc) { try { pc.close(); } catch {} pc = null; }
+    if (ws && ws.readyState <= 1) { try { ws.close(); } catch {} }
+    if (localTrack) { try { localTrack.stop(); } catch {} localTrack = null; }
+    btn.disabled = false;
+    bye.disabled = true;
+    say('[APP] disconnected', 'warn');
+  }
 
   document.getElementById('btn').addEventListener('click', async () => {
     try { await connect(); }
-    catch (e) { say('Ошибка: ' + e, 'err'); document.getElementById('btn').disabled = false; }
+    catch (e) { say('Ошибка: ' + e, 'err'); btn.disabled = false; bye.disabled = true; }
   });
+  bye.addEventListener('click', disconnect);
 })();
 </script>
 </body>
