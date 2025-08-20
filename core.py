@@ -301,6 +301,9 @@ async def http_style(request):
 async def http_icon(request):
     return web.FileResponse(STATIC_DIR / "icon.svg")
 
+async def http_app(request):
+    return web.FileResponse(STATIC_DIR / "app.js")
+
 async def http_healthz(request):
     return web.Response(text="ok")
 
@@ -423,6 +426,7 @@ async def start_http_server(max_peers: int = 2):
         web.get("/", http_index),
         web.get("/style.css", http_style),
         web.get("/icon.svg", http_icon),
+        web.get("/app.js", http_app),
         web.get("/favicon.ico", http_icon),
         web.get("/ws", http_ws),
         web.get("/healthz", http_healthz),
@@ -432,7 +436,7 @@ async def start_http_server(max_peers: int = 2):
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", HTTP_PORT)
     await site.start()
-    log.info("[HTTP] http://0.0.0.0:%d (/, /style.css, /icon.svg, /ws, /healthz, /status) — capacity=%d",
+    log.info("[HTTP] http://0.0.0.0:%d (/, /style.css, /app.js, /icon.svg, /ws, /healthz, /status) — capacity=%d",
              HTTP_PORT, MAX_PEERS)
 
 # ─── ICE утилиты ───────────────────────────────────────────────────
