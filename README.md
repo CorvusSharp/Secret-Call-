@@ -194,15 +194,7 @@ ssh -tt -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -R 80:127.
 
 ---
 
-## 🧪 Troubleshooting
 
-- **Join does nothing** → make sure the page is served over **HTTPS** and the browser has **mic permission**.  
-- **Peers won’t connect** → try another **STUN** server or enable a **TURN** server.  
-- **“Room is full”** → reduce participants or restart hosting with a larger capacity.  
-- **Emoji panel misaligned** → ensure latest `index.html` + `style.css` are deployed.  
-- **Tunnel URL not shown** → verify `ssh` is installed and reachable in `PATH`.
-
----
 
 ## 🗺 Roadmap (suggested)
 - Built‑in TURN templates & provisioning.
@@ -397,15 +389,7 @@ ssh -tt -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -R 80:127.
 
 ---
 
-## 🧪 Диагностика
 
-- **«Войти» не работает** → проверьте **HTTPS** и разрешение на микрофон.  
-- **Пиры не соединяются** → другой **STUN** или включите **TURN**.  
-- **«Комната переполнена»** → уменьшите участников или перезапустите с большим лимитом.  
-- **Панель эмодзи смещена** → обновите `index.html` и `style.css`.  
-- **Нет публичного URL** → убедитесь, что `ssh` установлен и доступен в `PATH`.
-
----
 
 ## 🗺 Дорожная карта (предложение)
 - Готовые шаблоны и скрипты для TURN.
