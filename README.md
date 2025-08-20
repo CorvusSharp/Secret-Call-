@@ -1,208 +1,137 @@
-# 🔒 Secret-Call — Secure WebRTC Calls
+# 🔮 Secret-Call  
 
-[🇬🇧 English](#english) | [🇷🇺 Русский](#русский)
+<div align="center">
 
----
+✨ **End-to-End Encrypted WebRTC Calls** ✨  
+_Built with Python • Powered by the Browser_
 
-## English
+![Static Badge](https://img.shields.io/badge/WebRTC-secure-blue?logo=webrtc)  
+![Static Badge](https://img.shields.io/badge/Python-3.11+-yellow?logo=python)  
+![Static Badge](https://img.shields.io/badge/license-MIT-green?logo=open-source-initiative)
 
-### 🚀 About the Project
-**Secret-Call** is a secure, peer-to-peer voice calling application built on **WebRTC** and **Python (aiohttp, aiortc)**.  
-It allows you to make **end-to-end encrypted calls** directly in the browser, without third-party servers storing your data.
-
-The main goal:  
-- Provide a **simple**, **secure**, and **self-hosted** alternative to popular messengers like Telegram or WhatsApp.  
-- Fully **open-source** and **self-controlled**.  
+</div>
 
 ---
 
-### 🛠️ Technologies
-- **Python 3.11+**
-- **aiohttp** — async web server
-- **aiortc** — WebRTC implementation for Python
-- **sounddevice** — audio input/output
-- **WebSockets** — signaling channel
-- **HTML + CSS + JS** (frontend)
-- **Cloudflare Tunnel / localhost.run** (optional public access)
+## 🚀 Features
+- 🔒 **Secure** — DTLS-SRTP, no third-party storage  
+- 🌍 **Group & 1-to-1 calls** right in your browser  
+- 🎨 **Futuristic UI** with particles & gradients  
+- ⚡ **Self-hosted** — you stay in control  
+- 🛠 **Python Backend**: aiohttp + aiortc  
 
 ---
 
-### 🔧 Installation
+## 🧰 Tech Stack
+```text
+Python 3.11+
+├─ aiohttp       → async web server + WebSocket signaling
+├─ aiortc        → WebRTC (SDP, ICE, SRTP)
+├─ sounddevice   → optional local audio
+├─ av            → media handling
+└─ cryptography  → security layer
+```
 
-Clone the repo:
+Frontend:
+- HTML5 / CSS3 (glassmorphism + particles)
+- Vanilla JS (WebRTC, chat, emoji, mentions)
+
+---
+
+## ⚡ Quickstart
+
+### 1. Clone
 ```bash
 git clone https://github.com/yourname/Secret-Call.git
 cd Secret-Call
 ```
 
-Create venv:
+### 2. Setup venv
 ```bash
-python -m venv venv
-source venv/bin/activate   # Linux / Mac
-venv\Scripts\activate      # Windows
+# Linux / macOS
+python -m venv .venv
+source .venv/bin/activate
+
+# Windows (PowerShell)
+python -m venv .venv
+.venv\Scripts\Activate.ps1
 ```
 
-Install requirements:
+### 3. Install deps
 ```bash
+pip install -U pip setuptools wheel
 pip install -r requirements.txt
 ```
 
----
+<details>
+<summary>📦 If you don’t have <code>requirements.txt</code> yet</summary>
 
-### ▶️ Usage
+```txt
+aiohttp>=3.9
+aiortc>=1.7
+websockets>=12
+sounddevice>=0.4
+av>=12
+cryptography>=42
+```
+</details>
 
-Start server:
+### 4. Run
 ```bash
 python main.py
 ```
 
-Then open in your browser:
-```
-https://localhost:8790
-```
-
-You can choose how many participants are allowed (1x1 or group) **before launching the server**.  
-If the limit is reached, new users will see a styled popup in the browser:  
-❌ *"The room is full, please try again later."*
+Then open:  
+👉 **https://localhost:8790**
 
 ---
 
-### 🌍 Public Access
+## 🌍 Public Access
+Expose to the world:
 
-If you want to allow external users:
+**Cloudflare Tunnel**
 ```bash
 cloudflared tunnel --url http://127.0.0.1:8790
 ```
-or
+
+**localhost.run**
 ```bash
 ssh -R 80:127.0.0.1:8790 nokey@localhost.run
 ```
 
 ---
 
-### 🔐 Security
-- All calls are encrypted with **DTLS-SRTP**  
-- No call metadata stored on server  
-- Self-hosted → you are in full control  
-
----
-
-### 📂 Project Structure
+## 🗂 Project Structure
 ```
 Secret-Call/
-├── main.py                # Entry point
-├── core.py                # Core logic (WebRTC sessions)
-├── gui.py                 # GUI control (slider for participants)
-├── tunnel.py              # Tunnel integrations
-├── async_runner.py        # Async helper
-├── static/                # Frontend files
-│   ├── index.html
-│   ├── style.css
-│   └── icon.svg
-└── README.md
+├─ main.py
+├─ core.py
+├─ gui.py
+├─ tunnel.py
+├─ async_runner.py
+├─ index.html
+├─ style.css
+└─ icon.svg
 ```
 
 ---
 
-### 📜 License
-MIT License — free to use and modify.
+## 🧪 Checklist
+- ✅ Mic permission allowed  
+- ✅ Join button toggles → Leave  
+- ✅ Status shows **Live**  
+- ✅ Emoji panel works  
+- ✅ Mentions work  
+- ✅ WSS connected to `/ws`  
 
 ---
 
-## Русский
-
-### 🚀 О проекте
-**Secret-Call** — это безопасное приложение для голосовых звонков, построенное на **WebRTC** и **Python (aiohttp, aiortc)**.  
-Оно позволяет совершать **сквозное зашифрованное соединение** прямо в браузере, без участия сторонних серверов.
-
-Главная цель:  
-- Дать простую и **надёжную альтернативу** мессенджерам вроде Telegram и WhatsApp.  
-- Полный **open-source** и **контроль у владельца сервера**.  
+## 🆘 Troubleshooting
+- **Join does nothing** → check mic permissions & HTTPS  
+- **No peers** → try another STUN, or public tunnel  
+- **Windows build issues** → keep `pip`, `setuptools`, `wheel` fresh  
 
 ---
 
-### 🛠️ Технологии
-- **Python 3.11+**
-- **aiohttp** — асинхронный веб-сервер
-- **aiortc** — реализация WebRTC на Python
-- **sounddevice** — ввод/вывод аудио
-- **WebSockets** — канал сигналинга
-- **HTML + CSS + JS** — фронтенд часть
-- **Cloudflare Tunnel / localhost.run** — для публичного доступа
-
----
-
-### 🔧 Установка
-
-Клонировать проект:
-```bash
-git clone https://github.com/yourname/Secret-Call.git
-cd Secret-Call
-```
-
-Создать виртуальное окружение:
-```bash
-python -m venv venv
-source venv/bin/activate   # Linux / Mac
-venv\Scripts\activate      # Windows
-```
-
-Установить зависимости:
-```bash
-pip install -r requirements.txt
-```
-
----
-
-### ▶️ Запуск
-
-Запустить сервер:
-```bash
-python main.py
-```
-
-Открыть в браузере:
-```
-https://localhost:8790
-```
-
-Перед запуском можно выбрать, **сколько максимум участников** будет в звонке (1х1 или групповая).  
-Если лимит превышен, пользователь увидит в браузере красивое окно:  
-❌ *"Комната переполнена, попробуйте позже."*
-
----
-
-### 🌍 Публичный доступ
-
-Для подключения извне можно использовать туннель:
-```bash
-cloudflared tunnel --url http://127.0.0.1:8790
-```
-или
-```bash
-ssh -R 80:127.0.0.1:8790 nokey@localhost.run
-```
-
----
-
-### 🔐 Безопасность
-- Все звонки зашифрованы протоколом **DTLS-SRTP**  
-- Сервер не хранит метаданные  
-- Самостоятельный хостинг = полный контроль у вас  
-
----
-
-### 📂 Структура проекта
-```
-Secret-Call/
-├── main.py                # Точка входа
-├── core.py                # Логика WebRTC
-├── gui.py                 # Интерфейс (слайдер для участников)
-├── tunnel.py              # Интеграция туннелей
-├── async_runner.py        # Хелпер для асинхронного запуска
-├── static/                # Файлы фронтенда
-│   ├── index.html
-│   ├── style.css
-│   └── icon.svg
-└── README.md
-```
+## 📜 License
+MIT — free to use, hack & remix  

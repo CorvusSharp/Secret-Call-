@@ -48,6 +48,18 @@
       <!-- Контейнер пиров -->
       <div id="peers" class="peers-grid"></div>
 
+      <!-- Чат -->
+      <section class="chat" aria-label="Групповой чат">
+        <div id="chat-log" class="chat__log" role="log" aria-live="polite"></div>
+        <div class="chat__row">
+          <div id="mentions-suggest" class="mentions-suggest" hidden></div>
+          <input id="chat-input" class="input" placeholder="Напишите сообщение и нажмите Enter…">
+          <button id="emoji-btn" class="emoji-btn" title="Эмодзи">😊</button>
+          <button id="chat-send" class="btn send">Отправить</button>
+          <div id="emoji-pop" class="emoji-pop" hidden></div>
+        </div>
+      </section>
+
       <!-- Мини-хелп -->
       <details class="help">
         <summary>Подсказки</summary>
@@ -195,7 +207,16 @@
   }
   function hideModal() { $('#join-modal')?.classList.add('hidden'); }
   $('#join-modal-ok')?.addEventListener('click', hideModal);
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { hideModal(); hideNet(); } });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      hideModal(); hideNet();
+      // закрыть поповеры эмодзи/упоминаний
+      const emojiPop = document.getElementById('emoji-pop');
+      const mentionBox = document.getElementById('mentions-suggest');
+      if (emojiPop) emojiPop.hidden = true;
+      if (mentionBox) mentionBox.hidden = true;
+    }
+  });
 
   function showNet() { $('#net-popover').classList.remove('hidden'); $('#stun-input').value = localStorage.getItem('STUN') || ''; }
   function hideNet() { $('#net-popover').classList.add('hidden'); }
@@ -206,6 +227,173 @@
     toast('STUN сохранён'); hideNet();
   });
   $('#stun-reset').addEventListener('click', () => { localStorage.removeItem('STUN'); $('#stun-input').value = ''; toast('STUN сброшен'); });
+
+  // ---------- Emoji & Mentions ----------
+  const emojiBtn = document.getElementById('emoji-btn');
+  const emojiPop = document.getElementById('emoji-pop');
+  const mentionBox = document.getElementById('mentions-suggest');
+  const chatLog = document.getElementById('chat-log');
+  const chatInput = document.getElementById('chat-input');
+  const chatSend = document.getElementById('chat-send');
+
+  // Common emoji set
+  const EMOJIS = '👍,👎,🙂,😉,😊,😂,🤣,😮,😢,😡,❤,🔥,✨,🎉,✅,❌,⭐,🚀,🎧,🎵,☎,💡,🧠,💬,🍀,☕,🍕,🍎'.split(',');
+  function buildEmojiPop() {
+    emojiPop.innerHTML = '';
+    // Header
+    const hdr = document.createElement('div');
+    hdr.className = 'emoji-pop__hdr';
+    const title = document.createElement('div');
+    title.className = 'emoji-pop__title';
+    title.textContent = 'Эмодзи';
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'emoji-pop__close';
+    close.textContent = '×';
+    close.title = 'Закрыть';
+    close.addEventListener('click', () => { emojiPop.hidden = true; chatInput.focus(); });
+    hdr.appendChild(title); hdr.appendChild(close);
+    emojiPop.appendChild(hdr);
+    const hr = document.createElement('hr'); emojiPop.appendChild(hr);
+    // Grid of emoji
+    EMOJIS.forEach(e => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = e;
+      b.addEventListener('click', () => {
+        insertAtCursor(chatInput, e);
+        emojiPop.hidden = true;
+        chatInput.focus();
+      });
+      emojiPop.appendChild(b);
+    });
+  }
+  function insertAtCursor(input, text) {
+    const start = input.selectionStart ?? input.value.length;
+    const end = input.selectionEnd ?? input.value.length;
+    const val = input.value;
+    input.value = val.slice(0, start) + text + val.slice(end);
+    const pos = start + text.length;
+    input.setSelectionRange(pos, pos);
+    input.dispatchEvent(new Event('input'));
+  }
+  emojiBtn?.addEventListener('click', () => {
+    if (emojiPop.hidden) { buildEmojiPop(); }
+    emojiPop.hidden = !emojiPop.hidden;
+  });
+  document.addEventListener('click', (e) => {
+    if (!emojiPop.hidden && !emojiPop.contains(e.target) && e.target !== emojiBtn) emojiPop.hidden = true;
+    if (!mentionBox.hidden && !mentionBox.contains(e.target)) mentionBox.hidden = true;
+  });
+
+  // Roster для @упоминаний
+  let rosterById = new Map();
+  function updateRoster(roster) {
+    rosterById = new Map(roster.map(p => [p.id, p.name || ""]));
+  }
+
+  function currentWordAtCaret(input) {
+    const pos = input.selectionStart ?? input.value.length;
+    const left = input.value.slice(0, pos);
+    const m = left.match(/(^|\s)(@[\w\-]{0,32})$/);
+    if (!m) return null;
+    return {start: pos - m[2].length, end: pos, token: m[2]};
+  }
+  function showMentionSuggest(prefix) {
+    const q = prefix.slice(1).toLowerCase();
+    const opts = [];
+    for (const [id, name] of rosterById.entries()) {
+      const shortId = id.slice(0,6);
+      const label = name || shortId;
+      if (!q || label.toLowerCase().includes(q) || shortId.startsWith(q)) {
+        opts.push({id, name, label});
+      }
+    }
+    if (!opts.length) { mentionBox.hidden = true; return; }
+    mentionBox.innerHTML = "";
+    opts.slice(0, 20).forEach((o, idx) => {
+      const div = document.createElement('div');
+      div.className = 'opt' + (idx===0?' active':'');
+
+      div.textContent = '@' + (o.name || o.id.slice(0,6));
+      div.dataset.id = o.id;
+      div.addEventListener('click', () => applyMentionFromBox(o.id, o.name));
+      mentionBox.appendChild(div);
+    });
+    mentionBox.hidden = false;
+  }
+  function applyMentionFromBox(id, name) {
+    const cur = currentWordAtCaret(chatInput);
+    if (!cur) return;
+    const label = '@' + (name || id.slice(0,6));
+    const val = chatInput.value;
+    chatInput.value = val.slice(0, cur.start) + label + val.slice(cur.end);
+    chatInput.focus();
+    mentionBox.hidden = true;
+  }
+  chatInput?.addEventListener('input', () => {
+    const cur = currentWordAtCaret(chatInput);
+    if (cur) showMentionSuggest(cur.token); else mentionBox.hidden = true;
+  });
+  chatInput?.addEventListener('keydown', (e) => {
+    if (!mentionBox.hidden && (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Enter')) {
+      e.preventDefault();
+      const items = Array.from(mentionBox.querySelectorAll('.opt'));
+      let idx = items.findIndex(x => x.classList.contains('active'));
+      if (e.key === 'ArrowDown') idx = Math.min(idx+1, items.length-1);
+      if (e.key === 'ArrowUp') idx = Math.max(idx-1, 0);
+      items.forEach((x,i)=>x.classList.toggle('active', i===idx));
+      if (e.key === 'Enter' && idx>=0) {
+        const el = items[idx];
+        applyMentionFromBox(el.dataset.id, el.textContent.slice(1));
+      }
+    }
+  });
+
+  function extractMentions(text) {
+    const ids = [];
+    const re = /@([\w\-]{1,32})/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const label = m[1].toLowerCase();
+      for (const [id, name] of rosterById.entries()) {
+        const shortId = id.slice(0,6).toLowerCase();
+        if ((name && name.toLowerCase() === label) || shortId === label) {
+          ids.push(id); break;
+        }
+      }
+    }
+    return Array.from(new Set(ids));
+  }
+
+  function fmtTime(ts) {
+    try { const d = new Date(ts); return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); }
+    catch { return ''; }
+  }
+  function appendChat({from: fromId, name, text, ts, mentions}) {
+    const mine = (fromId === myId);
+    const row = document.createElement('div');
+    row.className = 'chat__msg' + (mine ? ' mine' : '');
+    const meta = document.createElement('span');
+    meta.className = 'meta';
+    const who = name ? name : (fromId ? fromId.slice(0,6) : 'anon');
+    meta.textContent = `${who} · ${fmtTime(ts)}`;
+    const body = document.createElement('span');
+    body.className = 'body';
+    body.textContent = ' ' + text;
+    row.appendChild(meta); row.appendChild(body);
+    chatLog.appendChild(row);
+    chatLog.scrollTop = chatLog.scrollHeight;
+  }
+  function sendChat(){
+    const text = (chatInput.value||"").trim();
+    if(!text) return;
+    const mentions = extractMentions(text);
+    ws.send(JSON.stringify({type:"chat", text, mentions}));
+    chatInput.value = "";
+  }
+  chatSend?.addEventListener('click', sendChat);
+  chatInput?.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); sendChat(); } });
 
   // ---------- WebSocket + WebRTC ----------
   const peersEl = document.getElementById('peers');
@@ -306,12 +494,14 @@
     let m; try { m = JSON.parse(ev.data); } catch { return; }
 
     if (m.type === 'hello') {
+      updateRoster(m.roster || []);
       myId = m.id;
       setState('В комнате', 'ok');
       (m.roster||[]).filter(p => p.id !== myId).forEach(p => addPeerUI(p.id, p.name));
       return;
     }
     if (m.type === 'roster') {
+      updateRoster(m.roster || []);
       peersEl.innerHTML = '';
       (m.roster||[]).filter(p => p.id !== myId).forEach(p => addPeerUI(p.id, p.name));
       return;
@@ -320,6 +510,7 @@
       if (m.id !== myId) { addPeerUI(m.id); if (joined) maybeCall(m.id); toast('Кто-то подключился'); }
       return;
     }
+    if (m.type === 'chat') { appendChat(m); return; }
     if (m.type === 'peer-left') {
       removePeerUI(m.id); toast('Кто-то вышел', 'warn');
       return;

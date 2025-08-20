@@ -365,11 +365,29 @@ async def http_ws(request):
             if msg.type == web.WSMsgType.TEXT:
                 data = json.loads(msg.data)
                 typ = data.get("type")
+
                 if typ == "name":
                     ROOM["names"][pid] = data.get("name", "")[:64]
-                    await _broadcast({"type": "roster",
-                                      "roster": [{"id": p, "name": ROOM["names"].get(p, "")}
-                                                 for p in ROOM["peers"].keys()]})
+                    await _broadcast({
+                        "type": "roster",
+                        "roster": [
+                            {"id": p, "name": ROOM["names"].get(p, "")}
+                            for p in ROOM["peers"].keys()
+                        ],
+                    })
+
+                elif typ == "chat":
+                    text = (data.get("text") or "").strip()
+                    if text:
+                        payload = {
+                            "type": "chat",
+                            "from": pid,
+                            "name": ROOM["names"].get(pid, ""),
+                            "text": text,
+                            "ts": int(time.time() * 1000),
+                        }
+                        await _broadcast(payload)
+
                 elif typ in {"offer", "answer", "ice"}:
                     to = data.get("to")
                     if to and to in ROOM["peers"]:
@@ -379,6 +397,7 @@ async def http_ws(request):
                             await ROOM["peers"][to].send_str(json.dumps(data))
                         except Exception:
                             pass
+
             elif msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
                 break
     finally:
@@ -393,6 +412,7 @@ async def http_ws(request):
 
     # ВАЖНО: всегда возвращаем ws, чтобы не получить AttributeError в aiohttp
     return ws
+
 
 async def start_http_server(max_peers: int = 2):
     """Старт HTTP/WS сервера. Лимит участников задаётся параметром, по умолчанию 2."""
