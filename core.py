@@ -40,6 +40,7 @@ from aiortc.sdp import candidate_from_sdp
 import av
 from av.audio.resampler import AudioResampler
 from aiohttp import web
+from pathlib import Path
 
 # ─── Константы ──────────────────────────────────────────────────────
 HTTP_PORT = 8790
@@ -52,6 +53,9 @@ SAMPLE_WIDTH = 2  # int16
 FRAME_SAMPLES = 960  # 20 ms @ 48k
 
 LOG_FILE = "securecall_webrtc.log"
+
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
 
 # ─── Глобальные настройки аудио (громкость/мьют) ────────────────────
 
@@ -273,174 +277,15 @@ async def http_ws(request):
             pass
     return ws
 
-# ─── HTTP сайт ─────────────────────────────────────────────────────
-INDEX_HTML = """\
-<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Secure Call — WebRTC (Browser)</title>
-<style>
- body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
- .card { max-width: 720px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 12px; }
- h1 { margin-top: 0; font-size: 20px; }
- button { padding: 10px 16px; border-radius: 10px; border: 1px solid #ccc; background:#fff; cursor:pointer; }
- button:disabled { opacity: .6; cursor: default; }
- .row { margin: 10px 0; }
- .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
- .ok { color: #0a7; } .warn { color: #a70; } .err { color: #c00; }
- .help { margin-top:12px; font-size:13px; color:#555; }
- code { background: #f5f5f5; padding: 1px 4px; border-radius: 4px; }
-</style>
-</head>
-<body>
-<div class="card">
-  <h1>Secure Call — WebRTC (Browser)</h1>
-  <p>Нажмите «Подключиться» и разрешите доступ к микрофону. Связь идёт по <b>HTTPS/WSS</b>, если вы зашли по публичной ссылке.</p>
-  <div class="row">
-    <button id="btn">Подключиться</button>
-    <span id="st" class="mono"></span>
-  </div>
-  <div class="row">
-    <label><input type="checkbox" id="ec" checked> Echo Cancellation</label>
-    <label style="margin-left:12px;"><input type="checkbox" id="ns" checked> Noise Suppression</label>
-    <label style="margin-left:12px;"><input type="checkbox" id="agc" checked> Auto Gain</label>
-  </div>
-  <audio id="remote" autoplay playsinline></audio>
-  <div id="log" class="row mono" style="white-space:pre-wrap;"></div>
-  <div class="help">
-    Открывайте эту страницу через публичный HTTPS-домен туннеля — сигналинг будет WSS, а медиа пойдёт напрямую (или через TURN).
-  </div>
-</div>
-<script>
-(() => {
-  const logEl = document.getElementById('log');
-  const statusEl = document.getElementById('st');
-  const btn = document.getElementById('btn');
-  const audioEl = document.getElementById('remote');
-
-  const opts = () => ({
-    audio: {
-      channelCount: 1,
-      noiseSuppression: document.getElementById('ns').checked,
-      echoCancellation: document.getElementById('ec').checked,
-      autoGainControl: document.getElementById('agc').checked,
-      sampleRate: 48000
-    },
-    video: false
-  });
-
-  const say = (m, cls='') => { if (cls) statusEl.className = cls; statusEl.textContent = m; logEl.textContent += m + "\\n"; };
-
-  function filterCandidateStr(cand) {
-    if (cand.includes(' 127.') || cand.includes(' 169.254.') || cand.includes(' 192.168.56.')) return false;
-    return true;
-  }
-
-  const wsScheme = (location.protocol === 'https:') ? 'wss://' : 'ws://';
-  const wsURL = wsScheme + location.host + '/ws';
-
-  function parseIceFromEnv() {
-    try { return JSON.parse(window.ICE_URLS || "[]"); } catch { return []; }
-  }
-  const defaultIce = [{urls: 'stun:stun.l.google.com:19302'}];
-  const iceServers = (parseIceFromEnv().length ? parseIceFromEnv() : defaultIce);
-
-  async function connect() {
-    btn.disabled = true;
-    say('Инициализация…', 'mono');
-
-    const pc = new RTCPeerConnection({iceServers});
-    const ws = new WebSocket(wsURL);
-
-    pc.onicecandidate = ev => {
-      if (!ev.candidate) {
-        (ws.readyState === 1) && ws.send(JSON.stringify({type:'ice', candidate: null}));
-        return;
-      }
-      const cand = ev.candidate.candidate || '';
-      if (!filterCandidateStr(cand)) { say('[ICE] drop ' + cand); return; }
-      (ws.readyState === 1) && ws.send(JSON.stringify({
-        type: 'ice',
-        candidate: {
-          candidate: cand,
-          sdpMid: ev.candidate.sdpMid,
-          sdpMLineIndex: ev.candidate.sdpMLineIndex
-        }
-      }));
-    };
-
-    pc.ontrack = ev => {
-      say('[PC] ontrack audio', 'ok');
-      audioEl.srcObject = ev.streams[0] || new MediaStream([ev.track]);
-      audioEl.play().catch(()=>{});
-    };
-    pc.onconnectionstatechange   = () => say('[PC] state=' + pc.connectionState);
-    pc.oniceconnectionstatechange= () => say('[ICE] state=' + pc.iceConnectionState);
-
-    try {
-      const ms = await navigator.mediaDevices.getUserMedia(opts());
-      ms.getAudioTracks().forEach(t => pc.addTrack(t, ms));
-      say('[MEDIA] mic ok');
-    } catch (err) {
-      say('Микрофон не доступен: ' + err.name + ' — добавляю recvonly', 'warn');
-      pc.addTransceiver('audio', { direction: 'recvonly' });
-    }
-
-    ws.onopen = () => say('[WS] open', 'ok');
-    ws.onerror = () => say('[WS] error', 'err');
-    ws.onclose = () => say('[WS] closed', 'warn');
-
-    ws.onmessage = async (ev) => {
-      const data = JSON.parse(ev.data);
-      if (data.type === 'joined') {
-        const peers = data.peers || 1;
-        const isCaller = (peers >= 2);
-        say(`[WS] joined, peers=${peers}`);
-        if (isCaller) {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          ws.send(JSON.stringify({type:'offer', sdp: offer.sdp, sdpType: offer.type}));
-          say('[PC] offer sent');
-        } else {
-          say('[PC] waiting for offer…');
-        }
-      } else if (data.type === 'offer') {
-        say('[WS] got offer');
-        await pc.setRemoteDescription({type:'offer', sdp: data.sdp});
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        ws.send(JSON.stringify({type:'answer', sdp: answer.sdp, sdpType: answer.type}));
-        say('[PC] answer sent');
-      } else if (data.type === 'answer') {
-        say('[WS] got answer');
-        await pc.setRemoteDescription({type:'answer', sdp: data.sdp});
-      } else if (data.type === 'ice') {
-        const c = data.candidate;
-        if (c && c.candidate && filterCandidateStr(c.candidate)) {
-          try { await pc.addIceCandidate(c); } catch {}
-        } else if (c === null) {
-          try { await pc.addIceCandidate(null); } catch {}
-        }
-      } else if (data.type === 'full') {
-        say('[WS] room full', 'err');
-      }
-    };
-  }
-
-  document.getElementById('btn').addEventListener('click', async () => {
-    try { await connect(); }
-    catch (e) { say('Ошибка: ' + e, 'err'); document.getElementById('btn').disabled = false; }
-  });
-})();
-</script>
-</body>
-</html>
-"""
 
 async def http_index(request):
-    return web.Response(text=INDEX_HTML, content_type="text/html", charset="utf-8")
+    return web.FileResponse(STATIC_DIR / "index.html")
+
+async def http_style(request):
+    return web.FileResponse(STATIC_DIR / "style.css")
+
+async def http_icon(request):
+    return web.FileResponse(STATIC_DIR / "icon.svg")
 
 async def http_healthz(request):
     return web.Response(text="ok")
@@ -448,25 +293,22 @@ async def http_healthz(request):
 async def http_status(request):
     return web.json_response({"peers": len(ROOM["peers"])})
 
-FAVICON = b""
-
-async def http_favicon(request):
-    return web.Response(body=FAVICON, content_type="image/x-icon")
-
 async def start_http_server():
     app = web.Application()
     app.add_routes([
         web.get("/", http_index),
+        web.get("/style.css", http_style),
+        web.get("/icon.svg", http_icon),
+        web.get("/favicon.ico", http_icon),
         web.get("/ws", http_ws),
         web.get("/healthz", http_healthz),
         web.get("/status", http_status),
-        web.get("/favicon.ico", http_favicon),
     ])
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", HTTP_PORT)
     await site.start()
-    log.info("[HTTP] http://0.0.0.0:%d (/, /ws, /healthz, /status)", HTTP_PORT)
+    log.info("[HTTP] http://0.0.0.0:%d (/, /style.css, /icon.svg, /ws, /healthz, /status)", HTTP_PORT)
 
 # ─── Вспомогалки ICE ───────────────────────────────────────────────
 def _extract_ip_from_candidate(candidate_sdp: str) -> str | None:

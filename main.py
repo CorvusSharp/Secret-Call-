@@ -2,6 +2,7 @@
 
 import threading
 import tkinter as tk
+from pathlib import Path
 
 from async_runner import AsyncRunner
 from core import HTTP_PORT, log, start_http_server, start_udp_responder
@@ -17,6 +18,11 @@ def main() -> None:
     log.info("[BOOT] HTTP server scheduled, UDP responder started")
 
     root = tk.Tk()
+    try:
+        icon_path = Path(__file__).resolve().parent / "static" / "icon.svg"
+        root.iconphoto(True, tk.PhotoImage(file=icon_path))
+    except Exception:
+        pass
     app = App(root, runner)
 
     threading.Thread(

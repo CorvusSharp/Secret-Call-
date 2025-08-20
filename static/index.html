@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Secure Call — WebRTC (Browser)</title>
+<link rel="icon" type="image/svg+xml" href="/icon.svg" />
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div class="card">
+  <h1>Secure Call — WebRTC (Browser)</h1>
+  <div class="row">
+    <input id="name" type="text" placeholder="Ваше имя" />
+  </div>
+  <div class="row">
+    <button id="btn">Подключиться</button>
+    <span id="st" class="mono"></span>
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="ec" checked> Echo Cancellation</label>
+    <label><input type="checkbox" id="ns" checked> Noise Suppression</label>
+    <label><input type="checkbox" id="agc" checked> Auto Gain</label>
+  </div>
+  <div class="row">
+    <label>Микрофон <input type="range" id="micVol" min="0" max="100" value="100"></label>
+    <label><input type="checkbox" id="micMute"> Mute</label>
+  </div>
+  <div class="row">
+    <label>Собеседник <input type="range" id="remoteVol" min="0" max="100" value="100"></label>
+    <label><input type="checkbox" id="remoteMute"> Mute</label>
+  </div>
+  <audio id="remote" autoplay playsinline></audio>
+  <div id="log" class="row mono" style="white-space:pre-wrap;"></div>
+  <div class="help">
+    Открывайте эту страницу через публичный HTTPS-домен туннеля — сигналинг будет WSS, а медиа пойдёт напрямую (или через TURN).
+  </div>
+</div>
+<script>
+(() => {
+  const logEl = document.getElementById('log');
+  const statusEl = document.getElementById('st');
+  const btn = document.getElementById('btn');
+  const audioEl = document.getElementById('remote');
+  const nameEl = document.getElementById('name');
+  const micVolEl = document.getElementById('micVol');
+  const micMuteEl = document.getElementById('micMute');
+  const remoteVolEl = document.getElementById('remoteVol');
+  const remoteMuteEl = document.getElementById('remoteMute');
+
+  let micGain;
+  let localTrack;
+
+  const opts = () => ({
+    audio: {
+      channelCount: 1,
+      noiseSuppression: document.getElementById('ns').checked,
+      echoCancellation: document.getElementById('ec').checked,
+      autoGainControl: document.getElementById('agc').checked,
+      sampleRate: 48000
+    },
+    video: false
+  });
+
+  const say = (m, cls='') => { if (cls) statusEl.className = cls; statusEl.textContent = m; logEl.textContent += m + '\n'; };
+
+  function filterCandidateStr(cand) {
+    if (cand.includes(' 127.') || cand.includes(' 169.254.') || cand.includes(' 192.168.56.')) return false;
+    return true;
+  }
+
+  const wsScheme = (location.protocol === 'https:') ? 'wss://' : 'ws://';
+  const wsURL = wsScheme + location.host + '/ws';
+
+  function parseIceFromEnv() {
+    try { return JSON.parse(window.ICE_URLS || "[]"); } catch { return []; }
+  }
+  const defaultIce = [{urls: 'stun:stun.l.google.com:19302'}];
+  const iceServers = (parseIceFromEnv().length ? parseIceFromEnv() : defaultIce);
+
+  async function connect() {
+    btn.disabled = true;
+    say('Инициализация…', 'mono');
+
+    const pc = new RTCPeerConnection({iceServers});
+    const ws = new WebSocket(wsURL);
+
+    pc.onicecandidate = ev => {
+      if (!ev.candidate) {
+        (ws.readyState === 1) && ws.send(JSON.stringify({type:'ice', candidate: null}));
+        return;
+      }
+      const cand = ev.candidate.candidate || '';
+      if (!filterCandidateStr(cand)) { say('[ICE] drop ' + cand); return; }
+      (ws.readyState === 1) && ws.send(JSON.stringify({
+        type: 'ice',
+        candidate: {
+          candidate: cand,
+          sdpMid: ev.candidate.sdpMid,
+          sdpMLineIndex: ev.candidate.sdpMLineIndex
+        }
+      }));
+    };
+
+    pc.ontrack = ev => {
+      say('[PC] ontrack audio', 'ok');
+      audioEl.srcObject = ev.streams[0] || new MediaStream([ev.track]);
+      audioEl.play().catch(()=>{});
+    };
+    pc.onconnectionstatechange   = () => say('[PC] state=' + pc.connectionState);
+    pc.oniceconnectionstatechange= () => say('[ICE] state=' + pc.iceConnectionState);
+
+    try {
+      const ms = await navigator.mediaDevices.getUserMedia(opts());
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const src = ctx.createMediaStreamSource(ms);
+      micGain = ctx.createGain();
+      const dst = ctx.createMediaStreamDestination();
+      src.connect(micGain).connect(dst);
+      localTrack = dst.stream.getAudioTracks()[0];
+      pc.addTrack(localTrack, dst.stream);
+      say('[MEDIA] mic ok');
+    } catch (err) {
+      say('Микрофон не доступен: ' + err.name + ' — добавляю recvonly', 'warn');
+      pc.addTransceiver('audio', { direction: 'recvonly' });
+    }
+
+    ws.onopen = () => {
+      say('[WS] open', 'ok');
+      const n = nameEl.value.trim();
+      if (n) ws.send(JSON.stringify({type:'name', name: n}));
+    };
+    ws.onerror = () => say('[WS] error', 'err');
+    ws.onclose = () => say('[WS] closed', 'warn');
+
+    ws.onmessage = async (ev) => {
+      const data = JSON.parse(ev.data);
+      if (data.type === 'joined') {
+        const peers = data.peers || 1;
+        const isCaller = (peers >= 2);
+        say(`[WS] joined, peers=${peers}`);
+        if (isCaller) {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          ws.send(JSON.stringify({type:'offer', sdp: offer.sdp, sdpType: offer.type}));
+          say('[PC] offer sent');
+        } else {
+          say('[PC] waiting for offer…');
+        }
+      } else if (data.type === 'offer') {
+        say('[WS] got offer');
+        await pc.setRemoteDescription({type:'offer', sdp: data.sdp});
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({type:'answer', sdp: answer.sdp, sdpType: answer.type}));
+        say('[PC] answer sent');
+      } else if (data.type === 'answer') {
+        say('[WS] got answer');
+        await pc.setRemoteDescription({type:'answer', sdp: data.sdp});
+      } else if (data.type === 'ice') {
+        const c = data.candidate;
+        if (c && c.candidate && filterCandidateStr(c.candidate)) {
+          try { await pc.addIceCandidate(c); } catch {}
+        } else if (c === null) {
+          try { await pc.addIceCandidate(null); } catch {}
+        }
+      } else if (data.type === 'full') {
+        say('[WS] room full', 'err');
+      }
+    };
+
+    const updMic = () => {
+      if (!micGain) return;
+      const vol = micMuteEl.checked ? 0 : (micVolEl.value / 100);
+      micGain.gain.value = vol;
+      if (localTrack) localTrack.enabled = !micMuteEl.checked;
+    };
+    micVolEl.addEventListener('input', updMic);
+    micMuteEl.addEventListener('change', updMic);
+
+    const updRemote = () => {
+      audioEl.volume = remoteMuteEl.checked ? 0 : (remoteVolEl.value / 100);
+      audioEl.muted = remoteMuteEl.checked;
+    };
+    remoteVolEl.addEventListener('input', updRemote);
+    remoteMuteEl.addEventListener('change', updRemote);
+    updRemote();
+  }
+
+  document.getElementById('btn').addEventListener('click', async () => {
+    try { await connect(); }
+    catch (e) { say('Ошибка: ' + e, 'err'); document.getElementById('btn').disabled = false; }
+  });
+})();
+</script>
+</body>
+</html>
