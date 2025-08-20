@@ -67,16 +67,7 @@ pip install -U pip setuptools wheel
 pip install -r requirements.txt
 ```
 
-If you don’t have `requirements.txt` yet:
 
-```txt
-aiohttp>=3.9
-aiortc>=1.7
-websockets>=12
-sounddevice>=0.4
-av>=12
-cryptography>=42
-```
 
 4. Run
 ```bash
@@ -172,16 +163,7 @@ pip install -U pip setuptools wheel
 pip install -r requirements.txt
 ```
 
-Если файла `requirements.txt` ещё нет:
 
-```txt
-aiohttp>=3.9
-aiortc>=1.7
-websockets>=12
-sounddevice>=0.4
-av>=12
-cryptography>=42
-```
 
 4. Запустить
 ```bash
