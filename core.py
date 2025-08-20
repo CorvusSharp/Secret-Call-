@@ -1,51 +1,49 @@
 # secure_call_wss.py
 # ────────────────────────────────────────────────────────────────────
-# WebRTC-аудиозвонок «в одну кнопку» + авто-туннель localhost.run (универсально)
-# • Локально: HTTP сайт (http://<host>:8790) + WS сигналинг на /ws
+# WebRTC аудиозвонок с групповым режимом (mesh до 10 пиров) и адресным сигналингом
+# • HTTP сайт (/, /style.css, /icon.svg) + WS сигналинг на /ws
 # • Публично: автоматический SSH-туннель (localhost.run) с TLS-терминацией
-# • Аудио: 48 kHz mono int16, мини-джиттер-буфер
+# • Аудио: 48 kHz mono int16, мини-джиттер-буферы и софт-микшер для N удалённых дорожек
 # • Авто-хост/гость (UDP discovery в LAN)
-# • Фильтр ICE-кандидатов отбрасывает link-local, VBox host-only и пр.
+# • Фильтр ICE-кандидатов отбрасывает link-local, VBox host-only и т.п.
 #
-# pip install aiortc av sounddevice aiohttp websockets
-# Запуск: python secure_call_wss.py
+# pip install aiortc av sounddevice aiohttp websockets numpy
+# Запуск: python main.py
 # ────────────────────────────────────────────────────────────────────
 
 import asyncio
 import json
 import logging
-import queue
-import socket
-import threading
-import time
-import collections
-import re
-import sys
 import os
+import queue
+import random
+import re
+import socket
+import time
+import uuid
 from dataclasses import dataclass
-from fractions import Fraction
+from pathlib import Path
+from typing import Dict, Optional
 
 import numpy as np
 import sounddevice as sd
 import websockets
+from aiohttp import web
+from av.audio.resampler import AudioResampler
 from aiortc import (
     RTCPeerConnection,
     RTCSessionDescription,
-    RTCIceCandidate,
     RTCConfiguration,
+    RTCIceCandidate,
     RTCIceServer,
-    MediaStreamTrack,
 )
+from aiortc.rtcrtpsender import RTCRtpSender
 from aiortc.sdp import candidate_from_sdp
-import av
-from av.audio.resampler import AudioResampler
-from aiohttp import web
-from pathlib import Path
 
 # ─── Константы ──────────────────────────────────────────────────────
 HTTP_PORT = 8790
 DISCOVERY_PORT = 37020
-DISCOVERY_MSG = b"SECURECALL_WEBRTC_DISCOVER_V1"
+DISCOVERY_MSG = b"SECURECALL_WEBRTC_DISCOVER_V2"
 
 SAMPLE_RATE = 48000
 CHANNELS = 1
@@ -57,51 +55,54 @@ LOG_FILE = "securecall_webrtc.log"
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
-# ─── Глобальные настройки аудио (громкость/мьют) ────────────────────
+# ─── Логгер ─────────────────────────────────────────────────────────
+log = logging.getLogger("SecureCallWebRTC")
+if not log.handlers:
+    log.setLevel(logging.INFO)
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    log.addHandler(fh)
+    sh = logging.StreamHandler()
+    sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    log.addHandler(sh)
 
-
+# ─── Аудио настройки: локальные, по-умолчанию ──────────────────────
 @dataclass
 class AudioSettings:
-    """Runtime-configurable audio parameters."""
-
     mic_volume: float = 1.0
     mic_muted: bool = False
-    remote_volume: float = 1.0
-    remote_muted: bool = False
 
-
+# Глобальные локальные настройки для клиента Python
 AUDIO_SETTINGS = AudioSettings()
 
-# ─── Логирование ───────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
-)
-log = logging.getLogger("SecureCallWebRTC")
-logging.getLogger("aioice").setLevel(logging.WARNING)
+# ─── Глобальные параметры сигналинга ────────────────────────────────
+# Устанавливаются на старте сервера (из GUI). По умолчанию — 2 (1×1).
+MAX_PEERS: int = 2
+# Разрешать только браузерные подключения к /ws
+REJECT_NON_BROWSER: bool = True
 
 # ─── Утилиты ────────────────────────────────────────────────────────
 def get_local_ip() -> str:
-    ip = "127.0.0.1"
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
+        return s.getsockname()[0]
     except Exception:
-        pass
-    return ip
+        return "127.0.0.1"
+    finally:
+        s.close()
 
-LOCAL_IP = get_local_ip()
-
-async def wait_port(host: str, port: int, timeout=5.0) -> bool:
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
+async def wait_port(host: str, port: int, timeout: float = 2.0) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
         try:
-            with socket.create_connection((host, port), timeout=0.3):
-                return True
+            r, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+            w.close()
+            try:
+                await w.wait_closed()
+            except Exception:
+                pass
+            return True
         except OSError:
             await asyncio.sleep(0.1)
     return False
@@ -132,58 +133,45 @@ def start_udp_responder():
     def run():
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("", DISCOVERY_PORT))
-        log.info("[DISCOVERY] UDP responder on %d", DISCOVERY_PORT)
         try:
-            while True:
+            s.bind(("0.0.0.0", DISCOVERY_PORT))
+        except Exception as e:
+            log.warning("[UDP] bind failed: %s", e)
+            return
+        log.info("[UDP] discovery responder on %s", DISCOVERY_PORT)
+        while True:
+            try:
                 data, addr = s.recvfrom(4096)
                 if data == DISCOVERY_MSG:
-                    resp = json.dumps({"role": "host", "http_port": HTTP_PORT}).encode("utf-8")
+                    resp = json.dumps({"role": "host", "port": HTTP_PORT}).encode("utf-8")
                     s.sendto(resp, addr)
-        except Exception as e:
-            log.info("[DISCOVERY] responder stopped: %s", e)
-        finally:
-            s.close()
-    threading.Thread(target=run, name="UDPResponder", daemon=True).start()
+            except Exception:
+                pass
+    import threading
+    t = threading.Thread(target=run, name="UDPResponder", daemon=True)
+    t.start()
 
-# ─── Аудио слои ────────────────────────────────────────────────────
-class MicTrack(MediaStreamTrack):
+# ─── Аудио: микрофон → WebRTC track ─────────────────────────────────
+class MicTrack:
     kind = "audio"
     def __init__(self):
-        super().__init__()
-        self.q: "queue.Queue[bytes]" = queue.Queue(maxsize=120)
-        self._pts = 0
-        self._time_base = Fraction(1, SAMPLE_RATE)
-        self.stream = sd.RawInputStream(
+        self.stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
             dtype="int16",
             blocksize=FRAME_SAMPLES,
-            callback=self._callback,
         )
         self.stream.start()
         log.info("[AUDIO] Input started")
-    def _callback(self, indata, frames, time_info, status):
-        try:
-            arr = np.frombuffer(indata, dtype=np.int16)
-            if AUDIO_SETTINGS.mic_muted:
-                arr[:] = 0
-            else:
-                arr = (arr * AUDIO_SETTINGS.mic_volume).astype(np.int16)
-            self.q.put_nowait(arr.tobytes())
-        except queue.Full:
-            pass
     async def recv(self):
-        loop = asyncio.get_event_loop()
-        pcm = await loop.run_in_executor(None, self.q.get)
-        n = len(pcm) // SAMPLE_WIDTH
-        frame = av.AudioFrame(format="s16", layout="mono", samples=n)
-        frame.sample_rate = SAMPLE_RATE
-        frame.pts = self._pts
-        frame.time_base = self._time_base
-        frame.planes[0].update(pcm)
-        self._pts += n
-        return frame
+        data = self.stream.read(FRAME_SAMPLES)[0].tobytes()
+        if AUDIO_SETTINGS.mic_muted:
+            return b"\x00" * len(data)
+        if AUDIO_SETTINGS.mic_volume != 1.0:
+            arr = np.frombuffer(data, dtype=np.int16)
+            arr = np.clip(arr * AUDIO_SETTINGS.mic_volume, -32768, 32767).astype(np.int16)
+            data = arr.tobytes()
+        return data
     async def stop(self):
         try:
             self.stream.stop()
@@ -191,12 +179,12 @@ class MicTrack(MediaStreamTrack):
         except Exception:
             pass
         log.info("[AUDIO] Input stopped")
-        await super().stop()
 
+# ─── Аудио: проигрыватель ──────────────────────────────────────────
 class AudioPlayer:
     def __init__(self):
-        self.q: "queue.Queue[bytes]" = queue.Queue(maxsize=240)
-        self.stream = sd.RawOutputStream(
+        self.q: "queue.Queue[bytes]" = queue.Queue(maxsize=50)
+        self.stream = sd.OutputStream(
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
             dtype="int16",
@@ -205,26 +193,28 @@ class AudioPlayer:
         )
         self.stream.start()
         log.info("[AUDIO] Output started")
+
     def _callback(self, outdata, frames, time_info, status):
-        need = frames * SAMPLE_WIDTH
+        # Expect int16 mono frames; pull bytes from queue, convert to ndarray, pad/trim
+        need_samples = frames * CHANNELS
         try:
             data = self.q.get_nowait()
-        except queue.Empty:
-            outdata[:] = b"\x00" * need
+        except Exception:
+            outdata[:] = 0
             return
-        if len(data) < need:
-            data = data + b"\x00" * (need - len(data))
-        outdata[:] = data
+        arr = np.frombuffer(data, dtype=np.int16)
+        if arr.size < need_samples:
+            arr = np.pad(arr, (0, need_samples - arr.size), mode='constant')
+        else:
+            arr = arr[:need_samples]
+        outdata[:] = arr.reshape(frames, CHANNELS)
+
     def put(self, pcm: bytes):
         try:
-            arr = np.frombuffer(pcm, dtype=np.int16)
-            if AUDIO_SETTINGS.remote_muted:
-                arr[:] = 0
-            else:
-                arr = (arr * AUDIO_SETTINGS.remote_volume).astype(np.int16)
-            self.q.put_nowait(arr.tobytes())
+            self.q.put_nowait(pcm)
         except queue.Full:
             pass
+
     def close(self):
         try:
             self.stream.stop()
@@ -233,51 +223,75 @@ class AudioPlayer:
             pass
         log.info("[AUDIO] Output stopped")
 
+# ─── Джиттер-буфер ─────────────────────────────────────────────────
+from collections import deque
 class JitterBuffer:
     def __init__(self, target_packets=4, max_packets=200):
-        self.buf = collections.deque()
+        self.buf = deque()
         self.target = target_packets
-        self.max = max_packets
+        self.max_packets = max_packets
     def push(self, pcm: bytes):
-        if len(self.buf) >= self.max:
-            self.buf.popleft()
         self.buf.append(pcm)
-    def pop(self):
+        while len(self.buf) > self.max_packets:
+            self.buf.popleft()
+    def pop(self) -> Optional[bytes]:
         if len(self.buf) >= self.target:
             return self.buf.popleft()
         return None
 
-# ─── Комната и WS-сигналинг ────────────────────────────────────────
-ROOM: dict[str, list] = {"peers": []}
+# ─── Софт-микшер для нескольких удалённых источников ───────────────
+class AudioMixer:
+    def __init__(self, player: AudioPlayer):
+        self.player = player
+        self.jbs: Dict[str, JitterBuffer] = {}
+        self.vol: Dict[str, float] = {}
+        self.muted: Dict[str, bool] = {}
+        self._running = True
+        self._task: Optional[asyncio.Task] = None
+    def register_peer(self, peer_id: str):
+        self.jbs.setdefault(peer_id, JitterBuffer(target_packets=4, max_packets=200))
+        self.vol.setdefault(peer_id, 1.0)
+        self.muted.setdefault(peer_id, False)
+    def remove_peer(self, peer_id: str):
+        self.jbs.pop(peer_id, None)
+        self.vol.pop(peer_id, None)
+        self.muted.pop(peer_id, None)
+    def push(self, peer_id: str, pcm: bytes):
+        jb = self.jbs.get(peer_id)
+        if jb:
+            jb.push(pcm)
+    def set_volume(self, peer_id: str, v: float):
+        self.vol[peer_id] = max(0.0, min(2.0, v))
+    def set_muted(self, peer_id: str, m: bool):
+        self.muted[peer_id] = bool(m)
+    async def _loop(self):
+        silence = (np.zeros(FRAME_SAMPLES, dtype=np.int16)).tobytes()
+        while self._running:
+            arrays = []
+            for pid, jb in list(self.jbs.items()):
+                chunk = jb.pop() or silence
+                arr = np.frombuffer(chunk, dtype=np.int16).astype(np.int32)
+                if self.muted.get(pid, False):
+                    arr[:] = 0
+                else:
+                    arr = (arr * self.vol.get(pid, 1.0)).astype(np.int32)
+                arrays.append(arr)
+            if arrays:
+                mix = np.sum(arrays, axis=0)
+                mix = np.clip(mix, -32768, 32767).astype(np.int16)
+                self.player.put(mix.tobytes())
+            else:
+                self.player.put(silence)
+            await asyncio.sleep(FRAME_SAMPLES / SAMPLE_RATE)
+    def start(self):
+        if not self._task:
+            self._task = asyncio.create_task(self._loop())
+    async def stop(self):
+        self._running = False
+        if self._task:
+            await self._task
 
-async def http_ws(request):
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-    if len(ROOM["peers"]) >= 10:
-        await ws.send_json({"type": "full"})
-        await ws.close()
-        return ws
-    ROOM["peers"].append(ws)
-    try:
-        await ws.send_json({"type": "joined", "peers": len(ROOM["peers"])})
-        async for msg in ws:
-            if msg.type == web.WSMsgType.TEXT:
-                for other in list(ROOM["peers"]):
-                    if other is not ws and not other.closed:
-                        try:
-                            await other.send_str(msg.data)
-                        except Exception:
-                            pass
-            elif msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
-                break
-    finally:
-        try:
-            ROOM["peers"].remove(ws)
-        except ValueError:
-            pass
-    return ws
-
-
+# ─── HTTP и статик ─────────────────────────────────────────────────
 async def http_index(request):
     return web.FileResponse(STATIC_DIR / "index.html")
 
@@ -291,9 +305,99 @@ async def http_healthz(request):
     return web.Response(text="ok")
 
 async def http_status(request):
-    return web.json_response({"peers": len(ROOM["peers"])})
+    # теперь отдаём ещё и текущую вместимость
+    return web.json_response({"peers": len(ROOM["peers"]), "capacity": MAX_PEERS, "ok": True})
 
-async def start_http_server():
+# ─── Комната и адресный WS-сигналинг ───────────────────────────────
+# ROOM: peers -> id: ws, names -> id: display name
+ROOM = {"peers": {}, "names": {}}
+
+async def _broadcast(payload: dict, exclude: Optional[str] = None):
+    dead = []
+    for pid, ws in list(ROOM["peers"].items()):
+        if exclude and pid == exclude:
+            continue
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead.append(pid)
+    for pid in dead:
+        try:
+            await ROOM["peers"][pid].close()
+        except Exception:
+            pass
+        ROOM["peers"].pop(pid, None)
+        ROOM["names"].pop(pid, None)
+
+def _is_browser(request) -> bool:
+    """Простейшая эвристика: пропускаем только браузерные UA."""
+    if not REJECT_NON_BROWSER:
+        return True
+    ua = (request.headers.get("User-Agent") or "").lower()
+    browser_markers = ("mozilla", "chrome", "safari", "firefox", "edg", "opr", "mobile")
+    return any(m in ua for m in browser_markers)
+
+async def http_ws(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    # Только браузеры
+    if not _is_browser(request):
+        await ws.send_json({"type": "browser-only", "reason": "Please join from a web browser"})
+        await ws.close()
+        return ws
+
+    # Лимит вместимости (устанавливается при старте сервера из GUI)
+    if len(ROOM["peers"]) >= MAX_PEERS:
+        await ws.send_json({"type": "full", "capacity": MAX_PEERS})
+        await ws.close()
+        return ws
+
+    pid = uuid.uuid4().hex
+    ROOM["peers"][pid] = ws
+    roster = [{"id": p, "name": ROOM["names"].get(p, "")} for p in ROOM["peers"].keys()]
+    await ws.send_json({"type": "hello", "id": pid, "roster": roster})
+    await _broadcast({"type": "peer-joined", "id": pid}, exclude=pid)
+    log.info("[WS] peer joined: %s (total=%d)", pid, len(ROOM["peers"]))
+
+    try:
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                data = json.loads(msg.data)
+                typ = data.get("type")
+                if typ == "name":
+                    ROOM["names"][pid] = data.get("name", "")[:64]
+                    await _broadcast({"type": "roster",
+                                      "roster": [{"id": p, "name": ROOM["names"].get(p, "")}
+                                                 for p in ROOM["peers"].keys()]})
+                elif typ in {"offer", "answer", "ice"}:
+                    to = data.get("to")
+                    if to and to in ROOM["peers"]:
+                        data = dict(data)
+                        data["from"] = pid
+                        try:
+                            await ROOM["peers"][to].send_str(json.dumps(data))
+                        except Exception:
+                            pass
+            elif msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
+                break
+    finally:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        ROOM["peers"].pop(pid, None)
+        ROOM["names"].pop(pid, None)
+        await _broadcast({"type": "peer-left", "id": pid})
+        log.info("[WS] peer left: %s (total=%d)", pid, len(ROOM["peers"]))
+
+    # ВАЖНО: всегда возвращаем ws, чтобы не получить AttributeError в aiohttp
+    return ws
+
+async def start_http_server(max_peers: int = 2):
+    """Старт HTTP/WS сервера. Лимит участников задаётся параметром, по умолчанию 2."""
+    global MAX_PEERS
+    MAX_PEERS = max(1, min(10, int(max_peers)))
     app = web.Application()
     app.add_routes([
         web.get("/", http_index),
@@ -308,23 +412,13 @@ async def start_http_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", HTTP_PORT)
     await site.start()
-    log.info("[HTTP] http://0.0.0.0:%d (/, /style.css, /icon.svg, /ws, /healthz, /status)", HTTP_PORT)
+    log.info("[HTTP] http://0.0.0.0:%d (/, /style.css, /icon.svg, /ws, /healthz, /status) — capacity=%d",
+             HTTP_PORT, MAX_PEERS)
 
-# ─── Вспомогалки ICE ───────────────────────────────────────────────
+# ─── ICE утилиты ───────────────────────────────────────────────────
 def _extract_ip_from_candidate(candidate_sdp: str) -> str | None:
     m = re.search(r"\scandidate:.*\s(\d+\.\d+\.\d+\.\d+)\s\d+\s", " " + candidate_sdp + " ")
     return m.group(1) if m else None
-
-def _same_subnet(ip1: str, ip2: str, bits=24) -> bool:
-    try:
-        a = list(map(int, ip1.split(".")))
-        b = list(map(int, ip2.split(".")))
-        mask = (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF
-        ai = (a[0] << 24) | (a[1] << 16) | (a[2] << 8) | a[3]
-        bi = (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]
-        return (ai & mask) == (bi & mask)
-    except Exception:
-        return False
 
 def parse_candidate_compat(cand_sdp: str, sdp_mid, sdp_mline_index):
     parsed = candidate_from_sdp(cand_sdp)
@@ -342,93 +436,140 @@ def parse_candidate_compat(cand_sdp: str, sdp_mid, sdp_mline_index):
         ip=parsed["ip"],
         port=parsed["port"],
         type=parsed["type"],
-        tcpType=parsed.get("tcpType"),
-        relAddr=parsed.get("relAddr"),
-        relPort=parsed.get("relPort"),
         sdpMid=sdp_mid,
         sdpMLineIndex=sdp_mline_index,
+        sdp=cand_sdp,
     )
 
+# Нормализатор ICE (исправляет 'dict' object has no attribute "urls")
 def _ice_servers_from_env():
-    raw = os.getenv("ICE_URLS", "")
-    if not raw:
-        return [RTCIceServer("stun:stun.l.google.com:19302")]
-    try:
-        arr = json.loads(raw)
-        servers = []
-        for s in arr:
-            servers.append(
-                RTCIceServer(
-                    urls=s["urls"],
-                    username=s.get("username"),
-                    credential=s.get("credential")
-                )
-            )
-        return servers
-    except Exception:
-        return [RTCIceServer("stun:stun.l.google.com:19302")]
+    """
+    Возвращает список RTCIceServer.
+    Поддерживает:
+      - STUN из переменной окружения STUN="stun:host:port"
+      - ICE_SERVERS как JSON:
+        ICE_SERVERS='[{"urls":["stun:stun1.l.google.com:19302"]},
+                      {"urls":["turn:turn.example.com"], "username":"u", "credential":"p"}]'
+    """
+    val = os.environ.get("ICE_SERVERS")
+    servers: list[RTCIceServer] = []
 
-# ─── WebRTC peer (Python сторона) ───────────────────────────────────
+    if val:
+        try:
+            raw = json.loads(val)
+            if isinstance(raw, dict):
+                raw = [raw]
+            for s in raw or []:
+                if isinstance(s, RTCIceServer):
+                    servers.append(s)
+                elif isinstance(s, dict):
+                    urls = s.get("urls") or s.get("url")
+                    username = s.get("username")
+                    credential = s.get("credential")
+                    if urls:
+                        servers.append(RTCIceServer(urls=urls, username=username, credential=credential))
+        except Exception as e:
+            log.warning("[ICE] Failed to parse ICE_SERVERS JSON: %s", e)
+
+    if not servers:
+        stun = os.environ.get("STUN", "stun:stun.l.google.com:19302")
+        servers = [RTCIceServer(urls=[stun])]
+
+    return servers
+
+# ─── WebRTC peer (Python сторона) — групповая mesh-схема ────────────
 @dataclass
 class PeerContext:
     ws_url: str   # ws://host:8790/ws
-    is_initiator: bool
+    is_initiator: bool  # сохраняем для обратной совместимости; в mesh решаем по id
     name: str = ""
 
 async def run_peer(ctx: PeerContext):
     cfg = RTCConfiguration(iceServers=_ice_servers_from_env())
-    pc = RTCPeerConnection(cfg)
-
     mic = MicTrack()
     player = AudioPlayer()
-    jb = JitterBuffer(target_packets=4, max_packets=200)
-    audio_sender = None
+    mixer = AudioMixer(player)
+    mixer.start()
 
-    @pc.on("track")
-    async def on_track(track):
-        log.info("[PC] on_track: %s", track.kind)
-        if track.kind != "audio":
-            return
-        resampler = AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
-        async def pump():
-            while True:
-                frame = await track.recv()
-                frames = resampler.resample(frame)
-                if not frames:
-                    continue
-                for f in frames:
-                    try:
-                        pcm = f.to_ndarray().tobytes()
-                    except Exception:
-                        pcm = bytes(f.planes[0])
-                    jb.push(pcm)
-                    ready = jb.pop()
-                    if ready is not None:
-                        player.put(ready)
-        asyncio.create_task(pump())
+    # Словари по удалённым пирам
+    pcs: Dict[str, RTCPeerConnection] = {}
+    pumps: Dict[str, asyncio.Task] = {}
 
-    def has_remote_audio_transceiver() -> bool:
-        for t in pc.getTransceivers():
-            if t.kind == "audio":
-                return True
-        return False
+    async def close_peer(pid: str):
+        pc = pcs.pop(pid, None)
+        if pc:
+            try:
+                await pc.close()
+            except Exception:
+                pass
+        mixer.remove_peer(pid)
+        t = pumps.pop(pid, None)
+        if t:
+            t.cancel()
 
-    async def attach_mic_if_allowed():
-        nonlocal audio_sender
-        if audio_sender is None:
-            audio_sender = pc.addTrack(mic)
-            log.info("[AUDIO] Mic track attached")
+    async def make_pc(remote_id: str) -> RTCPeerConnection:
+        pc = RTCPeerConnection(cfg)
 
-    async def send_ws(ws, payload):
-        await ws.send(json.dumps(payload))
+        # Локальный микрофон во все pc
+        sender: Optional[RTCRtpSender] = None
+        if sender is None:
+            sender = pc.addTrack(mic)
+
+        # Приходящие ICE → адресно
+        @pc.on("icecandidate")
+        async def on_ice(candidate):
+            if candidate is None:
+                await ws.send(json.dumps({"type": "ice", "to": remote_id, "candidate": None}))
+                return
+            cand_sdp = candidate.to_sdp()
+            ip = _extract_ip_from_candidate(cand_sdp) or ""
+            # фильтруем мусорные
+            bad = (ip.startswith("127.") or ip.startswith("169.254.") or ip.startswith("192.168.56.") or (".local" in cand_sdp))
+            if bad:
+                log.info("[ICE] skip %s", cand_sdp)
+                return
+            await ws.send(json.dumps({
+                "type": "ice",
+                "to": remote_id,
+                "candidate": {
+                    "candidate": cand_sdp,
+                    "sdpMid": getattr(candidate, "sdpMid", "0"),
+                    "sdpMLineIndex": getattr(candidate, "sdpMLineIndex", 0),
+                },
+            }))
+
+        # Получение аудио-дорожки
+        @pc.on("track")
+        async def on_track(track):
+            if track.kind != "audio":
+                return
+            mixer.register_peer(remote_id)
+            resampler = AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+            async def pump():
+                while True:
+                    frame = await track.recv()
+                    frames = resampler.resample(frame)
+                    if not frames:
+                        continue
+                    for f in frames:
+                        try:
+                            pcm = f.to_ndarray().tobytes()
+                        except Exception:
+                            pcm = bytes(f.planes[0])
+                        mixer.push(remote_id, pcm)
+            pumps[remote_id] = asyncio.create_task(pump())
+
+        pcs[remote_id] = pc
+        return pc
 
     async with websockets.connect(ctx.ws_url) as ws:
-        msg = json.loads(await ws.recv())
-        if msg.get("type") != "joined":
+        hello = json.loads(await ws.recv())
+        if hello.get("type") != "hello":
             raise RuntimeError("Signal: unexpected first message")
-        peers = msg.get("peers", 1)
-        is_caller = ctx.is_initiator or (peers >= 2)
+        my_id = hello["id"]
+        roster = [p["id"] for p in hello.get("roster", []) if p["id"] != my_id]
 
+        # Отправляем своё имя (если задано)
         if ctx.name:
             try:
                 await ws.send(json.dumps({"type": "name", "name": ctx.name}))
@@ -436,68 +577,65 @@ async def run_peer(ctx: PeerContext):
                 pass
             log.info("[USER] name sent: %s", ctx.name)
 
-        @pc.on("icecandidate")
-        async def on_ice(candidate):
-            if not candidate:
-                await send_ws(ws, {"type": "ice", "candidate": None})
-                return
-            cand_sdp = candidate.to_sdp()
-            ip = _extract_ip_from_candidate(cand_sdp) or ""
-            bad = (
-                ip.startswith("127.")
-                or ip.startswith("169.254.")
-                or ip.startswith("192.168.56.")
-                or ip == ""
-                or ".local" in cand_sdp
-            )
-            prefer_subnet = _same_subnet(ip, LOCAL_IP, bits=24)
-            if bad or (ip and not prefer_subnet and ip.startswith("192.168.")):
-                log.info("[ICE] drop candidate %s", cand_sdp.strip())
-                return
-            log.info("[ICE] keep candidate %s", cand_sdp.strip())
-            await send_ws(
-                ws,
-                {
-                    "type": "ice",
-                    "candidate": {
-                        "candidate": cand_sdp,
-                        "sdpMid": candidate.sdpMid,
-                        "sdpMLineIndex": candidate.sdpMLineIndex,
-                    },
-                },
-            )
+        # Правило чтобы избежать glare: инициатор — у кого меньший id
+        async def maybe_call(remote_id: str):
+            if my_id < remote_id:
+                pc = pcs.get(remote_id) or await make_pc(remote_id)
+                offer = await pc.createOffer()
+                await pc.setLocalDescription(offer)
+                await ws.send(json.dumps({"type": "offer", "to": remote_id,
+                                          "sdp": pc.localDescription.sdp, "sdpType": pc.localDescription.type}))
+                log.info("[PC] Offer → %s", remote_id)
 
-        if is_caller:
-            await attach_mic_if_allowed()
-            offer = await pc.createOffer()
-            await pc.setLocalDescription(offer)
-            await send_ws(ws, {"type": "offer", "sdp": pc.localDescription.sdp, "sdpType": pc.localDescription.type})
-            log.info("[PC] Offer sent")
-        else:
-            log.info("[PC] Waiting for offer...")
+        # Звоним всем уже в комнате по правилу
+        for pid in roster:
+            await maybe_call(pid)
 
+        # Основной цикл сигналинга
         async for raw in ws:
             data = json.loads(raw)
             typ = data.get("type")
 
-            if typ == "offer":
+            if typ == "peer-joined":
+                rid = data["id"]
+                if rid != my_id:
+                    await maybe_call(rid)
+
+            elif typ == "peer-left":
+                rid = data["id"]
+                await close_peer(rid)
+
+            elif typ == "offer":
+                rid = data.get("from")
+                if not rid:
+                    continue
+                pc = pcs.get(rid) or await make_pc(rid)
                 offer = RTCSessionDescription(sdp=data["sdp"], type="offer")
                 await pc.setRemoteDescription(offer)
-                if has_remote_audio_transceiver():
-                    await attach_mic_if_allowed()
-                else:
-                    log.warning("[SDP] Remote offer без audio m-line; отвечаем без локального аудио")
                 answer = await pc.createAnswer()
                 await pc.setLocalDescription(answer)
-                await send_ws(ws, {"type": "answer", "sdp": pc.localDescription.sdp, "sdpType": pc.localDescription.type})
-                log.info("[PC] Answer sent")
+                await ws.send(json.dumps({"type": "answer", "to": rid,
+                                          "sdp": pc.localDescription.sdp, "sdpType": pc.localDescription.type}))
+                log.info("[PC] Answer → %s", rid)
 
             elif typ == "answer":
+                rid = data.get("from")
+                if not rid:
+                    continue
+                pc = pcs.get(rid)
+                if not pc:
+                    continue
                 answer = RTCSessionDescription(sdp=data["sdp"], type="answer")
                 await pc.setRemoteDescription(answer)
-                log.info("[PC] Answer applied")
+                log.info("[PC] Answer applied from %s", rid)
 
             elif typ == "ice":
+                rid = data.get("from")
+                if not rid:
+                    continue
+                pc = pcs.get(rid)
+                if not pc:
+                    continue
                 c = data.get("candidate")
                 if c is None:
                     try:
@@ -506,22 +644,31 @@ async def run_peer(ctx: PeerContext):
                         pass
                     continue
                 cand_sdp = (c.get("candidate") or "").strip()
-                if not cand_sdp:
-                    continue
-                if ".local" in cand_sdp:
-                    log.info("[ICE] skip .local candidate: %s", cand_sdp)
+                if not cand_sdp or ".local" in cand_sdp:
                     continue
                 try:
-                    candidate_obj = parse_candidate_compat(
-                        cand_sdp=cand_sdp,
-                        sdp_mid=c.get("sdpMid"),
-                        sdp_mline_index=c.get("sdpMLineIndex"),
-                    )
+                    candidate_obj = RTCIceCandidate(sdpMid=c.get('sdpMid'), sdpMLineIndex=c.get('sdpMLineIndex'), candidate=cand_sdp)
                     await pc.addIceCandidate(candidate_obj)
                 except Exception as e:
                     log.info("[ICE] addIceCandidate error: %s (cand=%s)", e, c)
 
+        # WS закрыт
+        for pid in list(pcs.keys()):
+            await close_peer(pid)
         await mic.stop()
+        await mixer.stop()
         player.close()
-        await pc.close()
-        log.info("[PC] Closed")
+        log.info("[PC] Closed all")
+
+# ─── Экспортируем то, что использует GUI ───────────────────────────
+__all__ = [
+    "HTTP_PORT",
+    "PeerContext",
+    "get_local_ip",
+    "run_peer",
+    "udp_discover",
+    "wait_port",
+    "start_http_server",
+    "start_udp_responder",
+    "log",
+]

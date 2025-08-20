@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+env/
+ENV/
+venv311/
+
+# IDE / Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs & Dumps
+*.log
+*.out
+*.err
+*.pid
+*.db
+*.sqlite3
+
+# Build
+build/
+dist/
+*.spec
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Security keys
+*.pem
+*.crt
+*.key
+salt.bin

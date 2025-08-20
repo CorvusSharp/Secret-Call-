@@ -1,215 +1,439 @@
 <!doctype html>
 <html lang="ru">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Secure Call — WebRTC (Browser)</title>
-<link rel="icon" type="image/svg+xml" href="/icon.svg" />
-<link rel="stylesheet" href="/style.css" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1, viewport-fit=cover">
+  <title>Secure Call — Group</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <meta name="color-scheme" content="dark light">
 </head>
 <body>
-<div class="card">
-  <h1>Secure Call — WebRTC (Browser)</h1>
-  <div class="row">
-    <input id="name" type="text" placeholder="Ваше имя" />
+  <!-- Партиклы (canvas) -->
+  <canvas id="bg-particles" aria-hidden="true"></canvas>
+
+  <!-- Живые градиенты / переливы -->
+  <div class="blob-layer" aria-hidden="true">
+    <span class="blob b1"></span>
+    <span class="blob b2"></span>
+    <span class="blob b3"></span>
   </div>
-  <div class="row">
-    <button id="btn" class="primary">Подключиться</button>
-    <button id="bye" class="danger" disabled>Отключиться</button>
-    <span id="st" class="mono"></span>
+
+  <!-- Основная карточка -->
+  <main class="wrap">
+    <section class="card glass rise">
+      <header class="card__header">
+        <img class="brand" src="/icon.svg" alt="Secure Call" width="28" height="28">
+        <h1 class="title">Secure Call</h1>
+      </header>
+
+      <p class="muted">
+        Введите имя и подключайтесь. Настройки ниже — <b>локальные</b> (не влияют на других).
+      </p>
+
+      <div class="row join-row">
+        <input id="name" class="input" placeholder="Ваше имя" maxlength="32" autocomplete="name">
+        <!-- ОДНА КНОПКА: Войти ⇄ Выйти -->
+        <button id="join" class="btn primary glow" aria-pressed="false" data-mode="join">
+          <span class="btn__label">Войти</span>
+        </button>
+        <button id="settings" class="btn subtle" title="Сетевые настройки (STUN)" aria-pressed="false">⚙︎</button>
+      </div>
+
+      <!-- Панель статуса -->
+      <div class="statusbar" id="statusbar">
+        <span id="state" class="state-dot">Не подключено</span>
+      </div>
+
+      <!-- Контейнер пиров -->
+      <div id="peers" class="peers-grid"></div>
+
+      <!-- Мини-хелп -->
+      <details class="help">
+        <summary>Подсказки</summary>
+        <ul>
+          <li>Ползунок громкости управляет только вашими колонками.</li>
+          <li>Кнопка <b>Mute</b> глушит звук конкретного участника у вас.</li>
+          <li>Если комната переполнена — появится окно с пояснением.</li>
+        </ul>
+      </details>
+    </section>
+  </main>
+
+  <!-- Шаблон карточки участника -->
+  <template id="peer-tpl">
+    <article class="peer">
+      <div class="peer__hdr">
+        <span class="peer__name"></span>
+        <div class="peer__actions">
+          <button class="btn micro mute" aria-pressed="false">Mute</button>
+        </div>
+      </div>
+      <audio autoplay playsinline></audio>
+      <div class="peer__ctrls">
+        <label class="slider">
+          <span>Громкость</span>
+          <input type="range" min="0" max="200" value="100" class="vol">
+        </label>
+      </div>
+    </article>
+  </template>
+
+  <!-- Модалка ограничения / браузера -->
+  <div id="join-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="join-modal-title">
+    <div class="modal__card glass">
+      <h2 id="join-modal-title" class="modal__title">Невозможно подключиться</h2>
+      <p id="join-modal-text" class="modal__text">
+        Комната переполнена. Свободных мест нет.
+      </p>
+      <div class="modal__actions">
+        <button id="join-modal-ok" class="btn primary">Ок</button>
+      </div>
+    </div>
   </div>
-  <div class="row">
-    <label><input type="checkbox" id="ec" checked> Echo Cancellation</label>
-    <label><input type="checkbox" id="ns" checked> Noise Suppression</label>
-    <label><input type="checkbox" id="agc" checked> Auto Gain</label>
+
+  <!-- Панель сетевых настроек -->
+  <div id="net-popover" class="popover hidden" role="dialog" aria-modal="true" aria-labelledby="net-popover-title">
+    <div class="popover__card glass">
+      <h3 id="net-popover-title">Сетевые настройки</h3>
+      <label class="stack">
+        <span>STUN URL (для WebRTC):</span>
+        <input id="stun-input" class="input" placeholder="stun:stun.l.google.com:19302">
+      </label>
+      <div class="row end">
+        <button id="stun-reset" class="btn subtle">Сбросить</button>
+        <button id="stun-save" class="btn primary">Сохранить</button>
+      </div>
+    </div>
   </div>
-  <div class="row">
-    <label>Микрофон <input type="range" id="micVol" min="0" max="100" value="100"></label>
-    <label><input type="checkbox" id="micMute"> Mute</label>
-  </div>
-  <div class="row">
-    <label>Собеседник <input type="range" id="remoteVol" min="0" max="100" value="100"></label>
-    <label><input type="checkbox" id="remoteMute"> Mute</label>
-  </div>
-  <audio id="remote" autoplay playsinline></audio>
-  <div id="log" class="row mono" style="white-space:pre-wrap;"></div>
-  <div class="help">
-    Открывайте эту страницу через публичный HTTPS-домен туннеля — сигналинг будет WSS, а медиа пойдёт напрямую (или через TURN).
-  </div>
-</div>
-<script>
-(() => {
-  const logEl = document.getElementById('log');
-  const statusEl = document.getElementById('st');
-  const btn = document.getElementById('btn');
-  const bye = document.getElementById('bye');
-  const audioEl = document.getElementById('remote');
-  const nameEl = document.getElementById('name');
-  const micVolEl = document.getElementById('micVol');
-  const micMuteEl = document.getElementById('micMute');
-  const remoteVolEl = document.getElementById('remoteVol');
-  const remoteMuteEl = document.getElementById('remoteMute');
 
-  let micGain;
-  let localTrack;
-  let pc;
-  let ws;
+  <!-- Тосты -->
+  <div id="toasts" class="toasts" aria-live="polite"></div>
 
-  const opts = () => ({
-    audio: {
-      channelCount: 1,
-      noiseSuppression: document.getElementById('ns').checked,
-      echoCancellation: document.getElementById('ec').checked,
-      autoGainControl: document.getElementById('agc').checked,
-      sampleRate: 48000
-    },
-    video: false
-  });
-
-  const say = (m, cls='') => { if (cls) statusEl.className = cls; statusEl.textContent = m; logEl.textContent += m + '\n'; };
-
-  function filterCandidateStr(cand) {
-    if (cand.includes(' 127.') || cand.includes(' 169.254.') || cand.includes(' 192.168.56.')) return false;
-    return true;
-  }
-
-  const wsScheme = (location.protocol === 'https:') ? 'wss://' : 'ws://';
-  const wsURL = wsScheme + location.host + '/ws';
-
-  function parseIceFromEnv() {
-    try { return JSON.parse(window.ICE_URLS || "[]"); } catch { return []; }
-  }
-  const defaultIce = [{urls: 'stun:stun.l.google.com:19302'}];
-  const iceServers = (parseIceFromEnv().length ? parseIceFromEnv() : defaultIce);
-
-  async function connect() {
-    btn.disabled = true;
-    bye.disabled = false;
-    say('Инициализация…', 'mono');
-
-    pc = new RTCPeerConnection({iceServers});
-    ws = new WebSocket(wsURL);
-
-    pc.onicecandidate = ev => {
-      if (!ev.candidate) {
-        (ws.readyState === 1) && ws.send(JSON.stringify({type:'ice', candidate: null}));
-        return;
-      }
-      const cand = ev.candidate.candidate || '';
-      if (!filterCandidateStr(cand)) { say('[ICE] drop ' + cand); return; }
-      (ws.readyState === 1) && ws.send(JSON.stringify({
-        type: 'ice',
-        candidate: {
-          candidate: cand,
-          sdpMid: ev.candidate.sdpMid,
-          sdpMLineIndex: ev.candidate.sdpMLineIndex
-        }
-      }));
-    };
-
-    pc.ontrack = ev => {
-      say('[PC] ontrack audio', 'ok');
-      audioEl.srcObject = ev.streams[0] || new MediaStream([ev.track]);
-      audioEl.play().catch(()=>{});
-    };
-    pc.onconnectionstatechange   = () => say('[PC] state=' + pc.connectionState);
-    pc.oniceconnectionstatechange= () => say('[ICE] state=' + pc.iceConnectionState);
-
-    try {
-      const ms = await navigator.mediaDevices.getUserMedia(opts());
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const src = ctx.createMediaStreamSource(ms);
-      micGain = ctx.createGain();
-      const dst = ctx.createMediaStreamDestination();
-      src.connect(micGain).connect(dst);
-      localTrack = dst.stream.getAudioTracks()[0];
-      pc.addTrack(localTrack, dst.stream);
-      say('[MEDIA] mic ok');
-    } catch (err) {
-      say('Микрофон не доступен: ' + err.name + ' — добавляю recvonly', 'warn');
-      pc.addTransceiver('audio', { direction: 'recvonly' });
+  <script>
+  // ---------- Партиклы (фон) ----------
+  (function () {
+    const canvas = document.getElementById('bg-particles');
+    const ctx = canvas.getContext('2d', { alpha: true });
+    const DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    let W = 0, H = 0, particles = [];
+    function resize() {
+      W = canvas.width = Math.floor(window.innerWidth * DPR);
+      H = canvas.height = Math.floor(window.innerHeight * DPR);
+      canvas.style.width = window.innerWidth + 'px';
+      canvas.style.height = window.innerHeight + 'px';
+      spawn();
     }
-
-    ws.onopen = () => {
-      say('[WS] open', 'ok');
-      const n = nameEl.value.trim();
-      if (n) ws.send(JSON.stringify({type:'name', name: n}));
-    };
-    ws.onerror = () => say('[WS] error', 'err');
-    ws.onclose = () => {
-      say('[WS] closed', 'warn');
-      btn.disabled = false;
-      bye.disabled = true;
-    };
-
-    ws.onmessage = async (ev) => {
-      const data = JSON.parse(ev.data);
-      if (data.type === 'joined') {
-        const peers = data.peers || 1;
-        const isCaller = (peers >= 2);
-        say(`[WS] joined, peers=${peers}`);
-        if (isCaller) {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          ws.send(JSON.stringify({type:'offer', sdp: offer.sdp, sdpType: offer.type}));
-          say('[PC] offer sent');
-        } else {
-          say('[PC] waiting for offer…');
-        }
-      } else if (data.type === 'offer') {
-        say('[WS] got offer');
-        await pc.setRemoteDescription({type:'offer', sdp: data.sdp});
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        ws.send(JSON.stringify({type:'answer', sdp: answer.sdp, sdpType: answer.type}));
-        say('[PC] answer sent');
-      } else if (data.type === 'answer') {
-        say('[WS] got answer');
-        await pc.setRemoteDescription({type:'answer', sdp: data.sdp});
-      } else if (data.type === 'ice') {
-        const c = data.candidate;
-        if (c && c.candidate && filterCandidateStr(c.candidate)) {
-          try { await pc.addIceCandidate(c); } catch {}
-        } else if (c === null) {
-          try { await pc.addIceCandidate(null); } catch {}
-        }
-      } else if (data.type === 'full') {
-        say('[WS] room full', 'err');
+    function spawn() {
+      const count = Math.floor((W * H) / (130 * 130) * 0.75);
+      particles = Array.from({ length: count }, () => ({
+        x: Math.random() * W,
+        y: Math.random() * H,
+        r: 0.8 + Math.random() * 1.8,
+        a: 0.15 + Math.random() * 0.5,
+        vx: (Math.random() - 0.5) * 0.25 * DPR,
+        vy: (Math.random() - 0.5) * 0.25 * DPR,
+      }));
+    }
+    function step() {
+      ctx.clearRect(0, 0, W, H);
+      for (const p of particles) {
+        p.x += p.vx; p.y += p.vy;
+        if (p.x < -5) p.x = W + 5; if (p.x > W + 5) p.x = -5;
+        if (p.y < -5) p.y = H + 5; if (p.y > H + 5) p.y = -5;
+        const hue = (p.x / W) * 360;
+        ctx.beginPath();
+        ctx.fillStyle = `hsla(${hue}, 90%, 60%, ${p.a})`;
+        ctx.arc(p.x, p.y, p.r * DPR, 0, Math.PI * 2);
+        ctx.fill();
       }
-    };
+      requestAnimationFrame(step);
+    }
+    window.addEventListener('resize', resize, { passive: true });
+    resize(); step();
+  })();
 
-    const updMic = () => {
-      if (!micGain) return;
-      const vol = micMuteEl.checked ? 0 : (micVolEl.value / 100);
-      micGain.gain.value = vol;
-      if (localTrack) localTrack.enabled = !micMuteEl.checked;
-    };
-    micVolEl.addEventListener('input', updMic);
-    micMuteEl.addEventListener('change', updMic);
-
-    const updRemote = () => {
-      audioEl.volume = remoteMuteEl.checked ? 0 : (remoteVolEl.value / 100);
-      audioEl.muted = remoteMuteEl.checked;
-    };
-    remoteVolEl.addEventListener('input', updRemote);
-    remoteMuteEl.addEventListener('change', updRemote);
-    updRemote();
-  }
-  function disconnect() {
-    if (pc) { try { pc.close(); } catch {} pc = null; }
-    if (ws && ws.readyState <= 1) { try { ws.close(); } catch {} }
-    if (localTrack) { try { localTrack.stop(); } catch {} localTrack = null; }
-    btn.disabled = false;
-    bye.disabled = true;
-    say('[APP] disconnected', 'warn');
+  // ---------- Утилиты UI ----------
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+  function toast(text, type = 'info') {
+    const box = document.createElement('div');
+    box.className = `toast ${type}`;
+    box.textContent = text;
+    $('#toasts').appendChild(box);
+    setTimeout(() => box.classList.add('show'), 10);
+    setTimeout(() => { box.classList.remove('show'); setTimeout(()=>box.remove(), 400); }, 3500);
   }
 
-  document.getElementById('btn').addEventListener('click', async () => {
-    try { await connect(); }
-    catch (e) { say('Ошибка: ' + e, 'err'); btn.disabled = false; bye.disabled = true; }
+  // Ripple эффект на всех кнопках (визуальный отклик)
+  document.addEventListener('pointerdown', (e) => {
+    const btn = e.target.closest('.btn'); if (!btn) return;
+    btn.classList.add('is-pressed');
+    const rect = btn.getBoundingClientRect();
+    const r = Math.max(rect.width, rect.height);
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    const wave = document.createElement('span');
+    wave.className = 'ripple';
+    wave.style.left = (x - r/2) + 'px';
+    wave.style.top  = (y - r/2) + 'px';
+    wave.style.width = wave.style.height = r + 'px';
+    btn.appendChild(wave);
+    setTimeout(()=> wave.remove(), 600);
+  }, { passive: true });
+  ['pointerup','pointerleave','blur'].forEach(ev => {
+    document.addEventListener(ev, (e)=>{
+      const btn = e.target.closest?.('.btn'); if (!btn) return;
+      btn.classList.remove('is-pressed');
+    }, true);
   });
-  bye.addEventListener('click', disconnect);
-})();
-</script>
+
+  function showModal(title, text) {
+    $('#join-modal-title').textContent = title || 'Невозможно подключиться';
+    $('#join-modal-text').textContent = text || 'Попробуйте позже.';
+    $('#join-modal').classList.remove('hidden');
+    setTimeout(() => $('#join-modal-ok')?.focus(), 0);
+  }
+  function hideModal() { $('#join-modal')?.classList.add('hidden'); }
+  $('#join-modal-ok')?.addEventListener('click', hideModal);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { hideModal(); hideNet(); } });
+
+  function showNet() { $('#net-popover').classList.remove('hidden'); $('#stun-input').value = localStorage.getItem('STUN') || ''; }
+  function hideNet() { $('#net-popover').classList.add('hidden'); }
+  $('#settings').addEventListener('click', showNet);
+  $('#stun-save').addEventListener('click', () => { 
+    const v = $('#stun-input').value.trim();
+    if (v) localStorage.setItem('STUN', v); else localStorage.removeItem('STUN');
+    toast('STUN сохранён'); hideNet();
+  });
+  $('#stun-reset').addEventListener('click', () => { localStorage.removeItem('STUN'); $('#stun-input').value = ''; toast('STUN сброшен'); });
+
+  // ---------- WebSocket + WebRTC ----------
+  const peersEl = document.getElementById('peers');
+  const nameEl = document.getElementById('name');
+  const joinBtn = document.getElementById('join');
+  const tpl = document.getElementById('peer-tpl');
+
+  const pcs = new Map();    // id -> RTCPeerConnection
+  const audios = new Map(); // id -> <audio>
+  let myId = null;
+  let joined = false;
+  let micStream = null;
+
+  function setState(text, status='idle') {
+    const el = document.getElementById('state');
+    el.textContent = text;
+    el.setAttribute('data-status', status);
+  }
+
+  // создаём WS
+  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.addEventListener('open', () => setState('Соединение установлено', 'ok'));
+  ws.addEventListener('close', () => setState('Соединение закрыто', 'warn'));
+  ws.addEventListener('error', () => setState('Ошибка соединения', 'error'));
+
+  function addPeerUI(id, name) {
+    if (document.getElementById('peer-' + id)) return;
+    const node = tpl.content.cloneNode(true);
+    const root = $('.peer', node); root.id = 'peer-' + id;
+    $('.peer__name', node).textContent = name || id.slice(0,6);
+    const audio = $('audio', node);
+    const muteBtn = $('.mute', node);
+    const vol = $('.vol', node);
+    muteBtn.onclick = () => {
+      audio.muted = !audio.muted;
+      muteBtn.textContent = audio.muted ? 'Unmute' : 'Mute';
+      muteBtn.classList.toggle('is-on', audio.muted);
+      muteBtn.setAttribute('aria-pressed', audio.muted ? 'true' : 'false');
+    };
+    vol.oninput = () => { audio.volume = (+vol.value)/100; };
+    peersEl.appendChild(node);
+    audios.set(id, audio);
+  }
+  function removePeerUI(id) {
+    const el = document.getElementById('peer-' + id);
+    if (el) {
+      el.classList.add('bye');
+      setTimeout(()=>el.remove(), 300);
+    }
+    audios.delete(id);
+  }
+
+  function closeAllPeers() {
+    for (const [id, pc] of pcs) {
+      try { pc.getSenders().forEach(s=>s.track && s.track.stop()); } catch {}
+      try { pc.close(); } catch {}
+    }
+    pcs.clear();
+    peersEl.innerHTML = '';
+    audios.clear();
+  }
+
+  function makePC(remoteId) {
+    const stun = localStorage.getItem('STUN') || 'stun:stun.l.google.com:19302';
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: [stun] }] });
+    pcs.set(remoteId, pc);
+    if (micStream) micStream.getTracks().forEach(t => pc.addTrack(t, micStream));
+
+    pc.ontrack = (ev) => {
+      const [stream] = ev.streams;
+      addPeerUI(remoteId);
+      const audio = audios.get(remoteId);
+      audio.srcObject = stream;
+      // плавный fade-in
+      audio.volume = 0; const target = 1; let v = 0;
+      const tick = () => { v = Math.min(target, v + 0.05); audio.volume = v; if (v < target) requestAnimationFrame(tick); };
+      requestAnimationFrame(tick);
+    };
+
+    pc.onicecandidate = (e) => {
+      ws.send(JSON.stringify({ type:'ice', to:remoteId, candidate: e.candidate ? {
+        candidate: e.candidate.candidate, sdpMid: e.candidate.sdpMid, sdpMLineIndex: e.candidate.sdpMLineIndex
+      } : null }));
+    };
+    return pc;
+  }
+
+  async function maybeCall(remoteId) {
+    if (myId < remoteId && joined) {
+      const pc = pcs.get(remoteId) || makePC(remoteId);
+      const off = await pc.createOffer();
+      await pc.setLocalDescription(off);
+      ws.send(JSON.stringify({ type:'offer', to:remoteId, sdp:pc.localDescription.sdp, sdpType:pc.localDescription.type }));
+    }
+  }
+
+  ws.addEventListener('message', async (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+
+    if (m.type === 'hello') {
+      myId = m.id;
+      setState('В комнате', 'ok');
+      (m.roster||[]).filter(p => p.id !== myId).forEach(p => addPeerUI(p.id, p.name));
+      return;
+    }
+    if (m.type === 'roster') {
+      peersEl.innerHTML = '';
+      (m.roster||[]).filter(p => p.id !== myId).forEach(p => addPeerUI(p.id, p.name));
+      return;
+    }
+    if (m.type === 'peer-joined') {
+      if (m.id !== myId) { addPeerUI(m.id); if (joined) maybeCall(m.id); toast('Кто-то подключился'); }
+      return;
+    }
+    if (m.type === 'peer-left') {
+      removePeerUI(m.id); toast('Кто-то вышел', 'warn');
+      return;
+    }
+    if (m.type === 'offer') {
+      const from = m.from; const pc = pcs.get(from) || makePC(from);
+      await pc.setRemoteDescription({ type:'offer', sdp:m.sdp });
+      const ans = await pc.createAnswer();
+      await pc.setLocalDescription(ans);
+      ws.send(JSON.stringify({ type:'answer', to:from, sdp:pc.localDescription.sdp, sdpType:pc.localDescription.type }));
+      return;
+    }
+    if (m.type === 'answer') {
+      const pc = pcs.get(m.from); if (!pc) return;
+      await pc.setRemoteDescription({ type:'answer', sdp:m.sdp });
+      return;
+    }
+    if (m.type === 'ice') {
+      const pc = pcs.get(m.from); if (!pc) return;
+      const c = m.candidate;
+      if (c === null) { try { await pc.addIceCandidate(null); } catch {} ; return; }
+      if (!c.candidate || c.candidate.includes('.local')) return;
+      try { await pc.addIceCandidate(c); } catch {}
+      return;
+    }
+    if (m.type === 'full') {
+      const cap = typeof m.capacity === 'number' ? m.capacity : undefined;
+      const title = 'Комната заполнена';
+      const text = cap
+        ? `Достигнут лимит участников: ${cap}. Попробуйте позже.`
+        : 'Комната заполнена. Попробуйте позже.';
+      showModal(title, text);
+      try { ws.close(4001, 'room full'); } catch {}
+      setState('Комната заполнена', 'warn');
+      return;
+    }
+    if (m.type === 'browser-only') {
+      showModal('Требуется браузер', 'Подключение возможно только из браузера. Откройте ссылку в Chrome/Firefox/Safari/Edge.');
+      try { ws.close(4002, 'browser only'); } catch {}
+      setState('Только браузер', 'error');
+      return;
+    }
+  });
+
+  // ====== Кнопка Войти ⇄ Выйти с красивыми состояниями ======
+  function switchJoinButton(toState) {
+    const label = joinBtn.querySelector('.btn__label');
+    if (toState === 'leave') {
+      joinBtn.dataset.mode = 'leave';
+      joinBtn.classList.remove('primary','glow');
+      joinBtn.classList.add('danger','is-on');
+      joinBtn.setAttribute('aria-pressed','true');
+      label.textContent = 'Выйти';
+    } else {
+      joinBtn.dataset.mode = 'join';
+      joinBtn.classList.remove('danger','is-on');
+      joinBtn.classList.add('primary','glow');
+      joinBtn.setAttribute('aria-pressed','false');
+      label.textContent = 'Войти';
+    }
+  }
+
+  async function startCall() {
+    try {
+      setState('Запрашиваем микрофон…', 'idle');
+      micStream = await navigator.mediaDevices.getUserMedia({ audio:true });
+      ws.send(JSON.stringify({ type:'name', name: (nameEl.value || 'User').slice(0, 32) }));
+      joined = true;
+      // Позвонить всем уже видимым
+      $$('.peer').forEach(el => {
+        const id = el.id.replace('peer-',''); maybeCall(id);
+      });
+      toast('Микрофон включен');
+      setState('Вы в эфире', 'ok');
+      switchJoinButton('leave');
+    } catch (e) {
+      toast('Доступ к микрофону запрещён', 'error');
+      setState('Нет доступа к микрофону', 'error');
+      switchJoinButton('join');
+    }
+  }
+
+  async function leaveCall() {
+    try {
+      joined = false;
+      // остановить локальные треки
+      if (micStream) {
+        for (const t of micStream.getTracks()) { try { t.stop(); } catch {} }
+        micStream = null;
+      }
+      // закрыть все pc и очистить UI пиров
+      closeAllPeers();
+      setState('Вы вышли из разговора', 'warn');
+      toast('Вы вышли из разговора', 'warn');
+    } finally {
+      switchJoinButton('join');
+    }
+  }
+
+  joinBtn.onclick = async () => {
+    if (joinBtn.dataset.mode === 'join' && !joined) {
+      await startCall();
+    } else if (joinBtn.dataset.mode === 'leave') {
+      await leaveCall();
+    }
+  };
+
+  // Кнопка настроек получает toggle-состояние для наглядности
+  const settingsBtn = document.getElementById('settings');
+  settingsBtn.addEventListener('click', () => {
+    const opened = !document.getElementById('net-popover').classList.contains('hidden');
+    settingsBtn.classList.toggle('is-on', !opened);
+    settingsBtn.setAttribute('aria-pressed', !opened ? 'true' : 'false');
+  });
+  </script>
 </body>
 </html>
