@@ -25,6 +25,7 @@ import os
 from dataclasses import dataclass
 from fractions import Fraction
 
+import numpy as np
 import sounddevice as sd
 import websockets
 from aiortc import (
@@ -51,6 +52,21 @@ SAMPLE_WIDTH = 2  # int16
 FRAME_SAMPLES = 960  # 20 ms @ 48k
 
 LOG_FILE = "securecall_webrtc.log"
+
+# ─── Глобальные настройки аудио (громкость/мьют) ────────────────────
+
+
+@dataclass
+class AudioSettings:
+    """Runtime-configurable audio parameters."""
+
+    mic_volume: float = 1.0
+    mic_muted: bool = False
+    remote_volume: float = 1.0
+    remote_muted: bool = False
+
+
+AUDIO_SETTINGS = AudioSettings()
 
 # ─── Логирование ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -145,7 +161,12 @@ class MicTrack(MediaStreamTrack):
         log.info("[AUDIO] Input started")
     def _callback(self, indata, frames, time_info, status):
         try:
-            self.q.put_nowait(bytes(indata))
+            arr = np.frombuffer(indata, dtype=np.int16)
+            if AUDIO_SETTINGS.mic_muted:
+                arr[:] = 0
+            else:
+                arr = (arr * AUDIO_SETTINGS.mic_volume).astype(np.int16)
+            self.q.put_nowait(arr.tobytes())
         except queue.Full:
             pass
     async def recv(self):
@@ -192,7 +213,12 @@ class AudioPlayer:
         outdata[:] = data
     def put(self, pcm: bytes):
         try:
-            self.q.put_nowait(pcm)
+            arr = np.frombuffer(pcm, dtype=np.int16)
+            if AUDIO_SETTINGS.remote_muted:
+                arr[:] = 0
+            else:
+                arr = (arr * AUDIO_SETTINGS.remote_volume).astype(np.int16)
+            self.q.put_nowait(arr.tobytes())
         except queue.Full:
             pass
     def close(self):
@@ -223,7 +249,7 @@ ROOM: dict[str, list] = {"peers": []}
 async def http_ws(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    if len(ROOM["peers"]) >= 2:
+    if len(ROOM["peers"]) >= 10:
         await ws.send_json({"type": "full"})
         await ws.close()
         return ws
@@ -505,6 +531,7 @@ def _ice_servers_from_env():
 class PeerContext:
     ws_url: str   # ws://host:8790/ws
     is_initiator: bool
+    name: str = ""
 
 async def run_peer(ctx: PeerContext):
     cfg = RTCConfiguration(iceServers=_ice_servers_from_env())
@@ -559,6 +586,13 @@ async def run_peer(ctx: PeerContext):
             raise RuntimeError("Signal: unexpected first message")
         peers = msg.get("peers", 1)
         is_caller = ctx.is_initiator or (peers >= 2)
+
+        if ctx.name:
+            try:
+                await ws.send(json.dumps({"type": "name", "name": ctx.name}))
+            except Exception:
+                pass
+            log.info("[USER] name sent: %s", ctx.name)
 
         @pc.on("icecandidate")
         async def on_ice(candidate):
