@@ -419,6 +419,51 @@ saveTokenBtn?.addEventListener("click", () => {
 
 const pcs = new Map();   // id -> RTCPeerConnection
 const audios = new Map(); // id -> <audio>
+const audioOutSel = document.getElementById("audio-output");
+let selectedAudioOutput = "";
+
+if (audioOutSel && typeof HTMLMediaElement.prototype.setSinkId !== "function") {
+  audioOutSel.closest("label")?.setAttribute("hidden", "true");
+}
+
+async function setAudioOutput(audio) {
+  if (!audio || typeof audio.setSinkId !== "function" || !selectedAudioOutput) return;
+  try {
+    await audio.setSinkId(selectedAudioOutput);
+  } catch (err) {
+    console.warn("[AUDIO] setSinkId", err);
+  }
+}
+
+async function refreshAudioOutputs() {
+  if (!audioOutSel || !navigator.mediaDevices?.enumerateDevices) return;
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    audioOutSel.innerHTML = "";
+    for (const d of devices) {
+      if (d.kind === "audiooutput") {
+        const opt = document.createElement("option");
+        opt.value = d.deviceId;
+        opt.textContent = d.label || (d.deviceId === "default" ? "По умолчанию" : d.deviceId);
+        audioOutSel.appendChild(opt);
+      }
+    }
+    if (audioOutSel.options.length > 0) {
+      if (!selectedAudioOutput) {
+        selectedAudioOutput = audioOutSel.options[0].value;
+      }
+      audioOutSel.value = selectedAudioOutput;
+      audios.forEach((a) => setAudioOutput(a));
+    }
+  } catch (err) {
+    console.warn("[AUDIO] enumerateDevices", err);
+  }
+}
+
+audioOutSel?.addEventListener("change", () => {
+  selectedAudioOutput = audioOutSel.value;
+  audios.forEach((a) => setAudioOutput(a));
+});
 let myId = null;
 let joined = false;
 let micStream = null;
@@ -515,6 +560,7 @@ function addPeerUI(id, name) {
   }
   peersEl.appendChild(node);
   audios.set(id, audio);
+  setAudioOutput(audio);
 }
 
 function removePeerUI(id) {
@@ -558,6 +604,7 @@ function makePC(remoteId) {
     audio.muted = false;
     audio.autoplay = true;
     audio.playsInline = true;
+    setAudioOutput(audio);
 
     // Плавный fade-in
     audio.volume = 0;
@@ -787,6 +834,7 @@ async function startCall() {
     if (!micStream) {
       micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     }
+    await refreshAudioOutputs();
   } catch {
     toast("Доступ к микрофону запрещён", "error");
     setState("Нет доступа к микрофону", "error");
