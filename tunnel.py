@@ -12,6 +12,8 @@ from typing import Callable, Optional
 
 from core import HTTP_PORT, log
 
+PROD = os.environ.get("PROD") == "1"
+
 
 _TUNNEL_PROC = None
 _TUNNEL_URL: Optional[str] = None
@@ -53,6 +55,45 @@ def _extract_lhr_https(text: str) -> Optional[str]:
     return f"https://{m.group(1)}" if m else None
 
 
+def _check_pinned_fingerprint(host: str, expected: str) -> Optional[pathlib.Path]:
+    try:
+        scan = subprocess.run(
+            ["ssh-keyscan", host],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+        if scan.returncode != 0 or not scan.stdout:
+            log.error("[TUNNEL] ssh-keyscan failed for %s: %s", host, scan.stderr.strip())
+            return None
+        fp = subprocess.run(
+            ["ssh-keygen", "-lf", "-"],
+            input=scan.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if fp.returncode != 0:
+            log.error("[TUNNEL] ssh-keygen failed: %s", fp.stderr.strip())
+            return None
+        if expected not in fp.stdout:
+            log.error(
+                "[TUNNEL] host key fingerprint mismatch for %s: expected %s got %s",
+                host,
+                expected,
+                fp.stdout.strip(),
+            )
+            return None
+        kh = pathlib.Path.home() / ".ssh" / "localhost_run_known_hosts"
+        kh.parent.mkdir(parents=True, exist_ok=True)
+        kh.write_text(scan.stdout)
+        return kh
+    except Exception as e:
+        log.error("[TUNNEL] fingerprint check failed: %s", e)
+        return None
+
+
 def _tunnel_reader(proc: subprocess.Popen, on_url: Callable[[str], None] | None = None) -> None:
     """Read tunnel process output and extract the public URL."""
 
@@ -69,14 +110,15 @@ def _tunnel_reader(proc: subprocess.Popen, on_url: Callable[[str], None] | None 
         if chunk == "\n":
             line = buf.strip()
             if line:
-                log.info("[TUNNEL] %s", line)
+                if not PROD:
+                    log.info("[TUNNEL] %s", line)
 
                 url = _extract_lhr_https(line)
                 if url and not _TUNNEL_URL:
                     with _TUNNEL_LOCK:
                         _TUNNEL_URL = url
                         _TUNNEL_URL_EVENT.set()
-                    log.info("[TUNNEL] URL found: %s", url)
+                    log.info("[TUNNEL] URL found: %s", url if not PROD else "<hidden>")
                     if callable(on_url):
                         try:
                             on_url(url)
@@ -90,7 +132,7 @@ def _tunnel_reader(proc: subprocess.Popen, on_url: Callable[[str], None] | None 
                 with _TUNNEL_LOCK:
                     _TUNNEL_URL = url
                     _TUNNEL_URL_EVENT.set()
-                log.info("[TUNNEL] URL found (inline): %s", url)
+                log.info("[TUNNEL] URL found (inline): %s", url if not PROD else "<hidden>")
                 if callable(on_url):
                     try:
                         on_url(url)
@@ -125,15 +167,31 @@ def start_localhost_run_tunnel(local_port: int = HTTP_PORT, on_url: Callable[[st
             return
 
         host = os.environ.get("LOCALHOST_RUN_HOST", "nokey@localhost.run")
+        strict = "StrictHostKeyChecking=accept-new"
+        known_hosts_file = None
+        pinned = os.environ.get("PINNED_FINGERPRINT")
+        if pinned:
+            host_only = host.split("@")[-1]
+            kh = _check_pinned_fingerprint(host_only, pinned)
+            if not kh:
+                log.error("[TUNNEL] fingerprint verification failed, aborting tunnel start")
+                return
+            strict = "StrictHostKeyChecking=yes"
+            known_hosts_file = str(kh)
+
         cmd = [
             "ssh",
             "-tt",
             "-o",
-            "StrictHostKeyChecking=accept-new",
+            strict,
             "-o",
             "ServerAliveInterval=30",
             "-o",
             "ExitOnForwardFailure=yes",
+        ]
+        if known_hosts_file:
+            cmd += ["-o", f"UserKnownHostsFile={known_hosts_file}"]
+        cmd += [
             "-R",
             f"80:127.0.0.1:{local_port}",
             host,
@@ -171,7 +229,7 @@ def start_localhost_run_tunnel(local_port: int = HTTP_PORT, on_url: Callable[[st
 
                 if ch == "\n":
                     line = buf.strip("\r\n")
-                    if line:
+                    if line and not PROD:
                         log.info("[TUNNEL] %s", line)
 
                         if (not nudged) and ("your connection id is" in line.lower()):
@@ -187,7 +245,7 @@ def start_localhost_run_tunnel(local_port: int = HTTP_PORT, on_url: Callable[[st
                         url = _extract_lhr_https(line)
                         if url and _TUNNEL_URL is None:
                             _TUNNEL_URL = url
-                            log.info("[TUNNEL] URL: %s (open this on both devices)", _TUNNEL_URL)
+                            log.info("[TUNNEL] URL: %s", _TUNNEL_URL if not PROD else "<hidden>")
                             _safe_call_cb(_TUNNEL_URL)
                     buf = ""
 
@@ -205,7 +263,7 @@ def start_localhost_run_tunnel(local_port: int = HTTP_PORT, on_url: Callable[[st
                     url_inline = _extract_lhr_https(buf)
                     if url_inline:
                         _TUNNEL_URL = url_inline
-                        log.info("[TUNNEL] URL: %s (open this on both devices)", _TUNNEL_URL)
+                        log.info("[TUNNEL] URL: %s", _TUNNEL_URL if not PROD else "<hidden>")
                         _safe_call_cb(_TUNNEL_URL)
 
             log.info("[TUNNEL] process ended")
