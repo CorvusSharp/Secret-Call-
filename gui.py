@@ -120,11 +120,14 @@ class App:
         card.pack(padx=16, pady=10, ipadx=14, ipady=14, fill="x")
         self.card = card
 
-        # Token row
+        # ── Token row (единственный, с дефолтом "123") ────────────────
         row1 = ttk.Frame(card, style="Card.TFrame")
         row1.pack(fill="x")
-        ttk.Label(row1, text="Room token", style="Body.TLabel").grid(row=0, column=0, padx=(2, 10), pady=(2, 8))
-        self.token_var = tk.StringVar(value=os.environ.get("ROOM_TOKEN", ""))
+        ttk.Label(row1, text="Room token", style="Body.TLabel").grid(
+            row=0, column=0, padx=(2, 10), pady=(2, 8)
+        )
+        # ⬇️ дефолт берётся из ENV, а если пусто — "123"
+        self.token_var = tk.StringVar(value=os.environ.get("ROOM_TOKEN", "123"))
         self.token = ttk.Entry(row1, textvariable=self.token_var, style="Glass.TEntry")
         self.token.grid(row=0, column=1, sticky="ew", pady=(2, 8))
         row1.columnconfigure(1, weight=1)
@@ -135,11 +138,12 @@ class App:
         row2 = ttk.Frame(card, style="Card.TFrame")
         row2.pack(fill="x")
 
-        self.btn_1x1 = ttk.Button(row2, text="1×1 call", style="Primary.TButton", command=lambda: self._start(mode="1x1"))
-        self.btn_grp = ttk.Button(
-            row2, text="Group call (up to 10)", style="Ghost.TButton", command=lambda: self._start(mode="group")
-        )
-        self.btn_stop = ttk.Button(row2, text="Stop hosting", style="Danger.TButton", command=self._stop, state="disabled")
+        self.btn_1x1 = ttk.Button(row2, text="1×1 call", style="Primary.TButton",
+                                  command=lambda: self._start(mode="1x1"))
+        self.btn_grp = ttk.Button(row2, text="Group call (up to 10)", style="Ghost.TButton",
+                                  command=lambda: self._start(mode="group"))
+        self.btn_stop = ttk.Button(row2, text="Stop hosting", style="Danger.TButton",
+                                   command=self._stop, state="disabled")
 
         self.btn_1x1.grid(row=0, column=0, padx=(0, 8), pady=(2, 2))
         self.btn_grp.grid(row=0, column=1, padx=(0, 8), pady=(2, 2))

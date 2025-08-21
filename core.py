@@ -1,4 +1,4 @@
-# core.py 
+# core.py
 # ────────────────────────────────────────────────────────────────────
 # WebRTC аудиозвонок с групповым режимом (mesh до 10 пиров) и адресным сигналингом
 # • HTTP сайт (/, /style.css, /icon.svg) + WS сигналинг на /ws
@@ -16,7 +16,6 @@ import json
 import logging
 import os
 import queue
-import random
 import re
 import socket
 import time
@@ -58,9 +57,6 @@ MAX_MSGS_PER_SEC = 20     # простой лимит для антифлуда
 MAX_CHAT_LEN = 500
 MAX_NAME_LEN = 64
 
-# peer_id -> (window_start_ts_sec, count) (может использоваться для глобального антифлуда)
-_RATE_BUCKET: Dict[str, tuple[int, int]] = {}
-
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
@@ -81,18 +77,15 @@ class AudioSettings:
     mic_volume: float = 1.0
     mic_muted: bool = False
 
-# Глобальные локальные настройки для клиента Python
 AUDIO_SETTINGS = AudioSettings()
 
 # ─── Глобальные параметры сигналинга ────────────────────────────────
-# Устанавливаются на старте сервера (из GUI). По умолчанию — 2 (1×1).
-MAX_PEERS: int = 2
-# Разрешать только браузерные подключения к /ws
-REJECT_NON_BROWSER: bool = True
+MAX_PEERS: int = 2                              # лимит участников комнаты
+REJECT_NON_BROWSER: bool = True                 # пускать только браузеры
 
 # Разрешённые Origin'ы (CSV в env)
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
-# Токен комнаты (пустая строка => соединения не будут пущены логикой ниже — выставьте токен!)
+# Токен комнаты; ПУСТО => ПРОСТОЙ РЕЖИМ (без проверки токена)
 ROOM_TOKEN = os.environ.get("ROOM_TOKEN", "")
 
 # ─── Утилиты ────────────────────────────────────────────────────────
@@ -177,6 +170,7 @@ class MicTrack:
         )
         self.stream.start()
         log.info("[AUDIO] Input started")
+
     async def recv(self):
         data = self.stream.read(FRAME_SAMPLES)[0].tobytes()
         if AUDIO_SETTINGS.mic_muted:
@@ -186,6 +180,7 @@ class MicTrack:
             arr = np.clip(arr * AUDIO_SETTINGS.mic_volume, -32768, 32767).astype(np.int16)
             data = arr.tobytes()
         return data
+
     async def stop(self):
         try:
             self.stream.stop()
@@ -209,7 +204,6 @@ class AudioPlayer:
         log.info("[AUDIO] Output started")
 
     def _callback(self, outdata, frames, time_info, status):
-        # Expect int16 mono frames; pull bytes from queue, convert to ndarray, pad/trim
         need_samples = frames * CHANNELS
         try:
             data = self.q.get_nowait()
@@ -334,8 +328,9 @@ async def security_headers_mw(request, handler):
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("X-Frame-Options", "DENY")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
-    resp.headers.setdefault("Permissions-Policy", "microphone=(self)")
-    csp = "default-src 'self'; img-src 'self' data:; style-src 'self'; connect-src 'self' wss:;"
+    resp.headers.setdefault("Strict-Transport-Security", "max-age=15552000")
+    resp.headers.setdefault("Permissions-Policy", "camera=(self), microphone=(self), geolocation=()")
+    csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none'; frame-ancestors 'none'"
     if "Content-Security-Policy" in resp.headers:
         resp.headers["Content-Security-Policy"] = resp.headers["Content-Security-Policy"] + "; " + csp
     else:
@@ -343,8 +338,7 @@ async def security_headers_mw(request, handler):
     return resp
 
 # ─── Комната и адресный WS-сигналинг ───────────────────────────────
-# ROOM: peers -> id: ws, names -> id: display name
-ROOM = {"peers": {}, "names": {}}
+ROOM: Dict[str, Dict] = {"peers": {}, "names": {}}
 
 async def _broadcast(payload: dict, exclude: Optional[str] = None):
     dead = []
@@ -364,37 +358,84 @@ async def _broadcast(payload: dict, exclude: Optional[str] = None):
         ROOM["names"].pop(pid, None)
 
 def _is_browser(request) -> bool:
-    """Простейшая эвристика: пропускаем только браузерные UA."""
+    """
+    Допускаем только браузеры, если включено REJECT_NON_BROWSER.
+    """
     if not REJECT_NON_BROWSER:
         return True
     ua = (request.headers.get("User-Agent") or "").lower()
-    browser_markers = ("mozilla", "chrome", "safari", "firefox", "edg", "opr", "mobile")
-    return any(m in ua for m in browser_markers)
+    markers = ("mozilla", "chrome", "safari", "firefox", "edg", "opr", "mobile")
+    return any(m in ua for m in markers)
+
 
 async def http_ws(request):
-    # Origin check (если указан белый список)
+    """
+    WebSocket-сигналинг:
+      — Origin whitelist (ALLOWED_ORIGINS)
+      — Токен комнаты (ROOM_TOKEN) через subprotocol "token.<TOKEN>" или query ?t=TOKEN
+      — Проверка, что клиент — браузер
+      — Лимит вместимости
+      — Эхо-возврат выбранного subprotocol (обязательно для Chrome)
+      — Адресный сигналинг (offer/answer/ice) + чат + обновление имён
+    """
+    # ── Origin whitelist ─────────────────────────────────────────────
     origin = request.headers.get("Origin")
     if ALLOWED_ORIGINS and origin not in ALLOWED_ORIGINS:
         log.warning("[WS] forbidden Origin: %s", origin)
         return web.Response(status=403, text="Forbidden")
 
-    # Token check (?t=...)
-    token = request.query.get("t")
-    expected = os.environ.get("ROOM_TOKEN", "")
-    if not token or token != expected:
-        log.warning("[WS] unauthorized token from %s", request.remote)
+    # ── Token из subprotocol или query ───────────────────────────────
+    expected = os.environ.get("ROOM_TOKEN", "")  # может быть пустым
+    offered = (request.headers.get("Sec-WebSocket-Protocol") or "")
+    offered_items = [x.strip() for x in offered.split(",") if x.strip()]
+
+    # Нормализуем токен и запомним фактический элемент, который надо вернуть в ответе
+    proto_token = None     # нормализованное значение токена (expected)
+    matched_item = None    # строка из offered_items, которую вернём клиенту
+
+    for item in offered_items:
+        if expected:
+            if item == expected:
+                proto_token = expected
+                matched_item = item
+                break
+            if item.startswith("token.") and item.split("token.", 1)[1] == expected:
+                proto_token = expected
+                matched_item = item
+                break
+        else:
+            # dev/локалка: без ROOM_TOKEN можно принять первый непустой
+            if item and item != "null":
+                proto_token = item
+                matched_item = item
+                break
+
+    # fallback: токен в query (?t=...)
+    qtok = request.query.get("t", "")
+
+    # Решение по аутентификации
+    authed = False
+    if expected:
+        # Требуем ровно expected где-то (в subprotocol или в query)
+        if proto_token == expected or qtok == expected:
+            authed = True
+    else:
+        # Без ROOM_TOKEN пропускаем всех
+        authed = True
+
+    if not authed:
+        log.warning("[WS] unauthorized token from %s (offered=%s, qtok=%s)", request.remote, offered_items, qtok)
         return web.Response(status=401, text="Unauthorized")
 
-    # Только браузеры
+    # ── Только браузеры ──────────────────────────────────────────────
     if not _is_browser(request):
-        # Закрываем без подготовки соединения (или можно отдать текст и закрыть после prepare)
         ws_tmp = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_MSG_SIZE)
         await ws_tmp.prepare(request)
         await ws_tmp.send_json({"type": "browser-only", "reason": "Please join from a web browser"})
         await ws_tmp.close()
         return ws_tmp
 
-    # Лимит вместимости
+    # ── Лимит вместимости ────────────────────────────────────────────
     if len(ROOM["peers"]) >= MAX_PEERS:
         ws_tmp = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_MSG_SIZE)
         await ws_tmp.prepare(request)
@@ -402,10 +443,31 @@ async def http_ws(request):
         await ws_tmp.close()
         return ws_tmp
 
-    # Полноценное WS
-    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_MSG_SIZE)
+    # ── Негациация субпротокола (критично для Chrome) ────────────────
+    # Если клиент прислал список протоколов, сервер ДОЛЖЕН выбрать один и вернуть его.
+    selected_proto = None
+    if offered_items:
+        if matched_item:
+            selected_proto = matched_item                         # эхо-возвращаем ровно принятый элемент
+        elif not expected:
+            selected_proto = offered_items[0]                     # dev-режим — вернём первый предложенный
+        else:
+            # ROOM_TOKEN задан, но аутентификация прошла по query (?t=...);
+            # Chrome всё равно ждёт echo выбора subprotocol → вернём первый.
+            selected_proto = offered_items[0]
+
+    if selected_proto:
+        ws = web.WebSocketResponse(
+            heartbeat=20,
+            max_msg_size=MAX_MSG_SIZE,
+            protocols=[selected_proto],  # ← ВАЖНО: без этого Chrome нередко даёт 1006
+        )
+    else:
+        ws = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_MSG_SIZE)
+
     await ws.prepare(request)
 
+    # ── Регистрация пира ─────────────────────────────────────────────
     pid = uuid.uuid4().hex
     ROOM["peers"][pid] = ws
     roster = [{"id": p, "name": ROOM["names"].get(p, "")} for p in ROOM["peers"].keys()]
@@ -413,6 +475,7 @@ async def http_ws(request):
     await _broadcast({"type": "peer-joined", "id": pid}, exclude=pid)
     log.info("[WS] peer joined: %s (total=%d)", pid, len(ROOM["peers"]))
 
+    # ── Простой антифлуд ─────────────────────────────────────────────
     last_ts = 0
     msg_count = 0
 
@@ -425,7 +488,6 @@ async def http_ws(request):
             if msg_count >= MAX_MSGS_PER_SEC:
                 if msg_count == MAX_MSGS_PER_SEC:
                     log.warning("[WS] rate limit exceeded for %s", pid)
-                # Тихо игнорируем
                 continue
             msg_count += 1
 
@@ -434,6 +496,7 @@ async def http_ws(request):
                     data = json.loads(msg.data)
                 except Exception:
                     continue
+
                 typ = data.get("type")
                 if typ not in {"name", "chat", "offer", "answer", "ice"}:
                     continue
@@ -442,10 +505,7 @@ async def http_ws(request):
                     ROOM["names"][pid] = (data.get("name", "") or "")[:MAX_NAME_LEN]
                     await _broadcast({
                         "type": "roster",
-                        "roster": [
-                            {"id": p, "name": ROOM["names"].get(p, "")}
-                            for p in ROOM["peers"].keys()
-                        ],
+                        "roster": [{"id": p, "name": ROOM["names"].get(p, "")} for p in ROOM["peers"].keys()],
                     })
 
                 elif typ == "chat":
@@ -468,13 +528,7 @@ async def http_ws(request):
                         sdp_type = data.get("sdpType")
                         if not isinstance(sdp, str) or not sdp:
                             continue
-                        payload = {
-                            "type": typ,
-                            "from": pid,
-                            "to": to,
-                            "sdp": sdp,
-                            "sdpType": sdp_type,
-                        }
+                        payload = {"type": typ, "from": pid, "to": to, "sdp": sdp, "sdpType": sdp_type}
                         try:
                             await ROOM["peers"][to].send_json(payload)
                         except Exception:
@@ -501,7 +555,9 @@ async def http_ws(request):
 
             elif msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
                 break
+
     finally:
+        # ── Очистка ──────────────────────────────────────────────────
         try:
             await ws.close()
         except Exception:
@@ -512,6 +568,8 @@ async def http_ws(request):
         log.info("[WS] peer left: %s (total=%d)", pid, len(ROOM["peers"]))
 
     return ws
+
+
 
 async def start_http_server(max_peers: int = 2):
     """Старт HTTP/WS сервера. Лимит участников задаётся параметром, по умолчанию 2."""
@@ -561,12 +619,11 @@ def parse_candidate_compat(cand_sdp: str, sdp_mid, sdp_mline_index):
         sdp=cand_sdp,
     )
 
-# Нормализатор ICE (исправляет 'dict' object has no attribute "urls")
 def _ice_servers_from_env():
     """
     Возвращает список RTCIceServer.
     Поддерживает:
-      - STUN из переменной окружения STUN="stun:host:port"
+      - STUN из env STUN="stun:host:port"
       - ICE_SERVERS как JSON:
         ICE_SERVERS='[{"urls":["stun:stun1.l.google.com:19302"]},
                       {"urls":["turn:turn.example.com"], "username":"u", "credential":"p"}]'
@@ -601,7 +658,7 @@ def _ice_servers_from_env():
 @dataclass
 class PeerContext:
     ws_url: str   # ws://host:8790/ws
-    is_initiator: bool  # сохраняем для обратной совместимости; в mesh решаем по id
+    is_initiator: bool
     name: str = ""
 
 async def run_peer(ctx: PeerContext):
@@ -611,7 +668,6 @@ async def run_peer(ctx: PeerContext):
     mixer = AudioMixer(player)
     mixer.start()
 
-    # Словари по удалённым пирам
     pcs: Dict[str, RTCPeerConnection] = {}
     pumps: Dict[str, asyncio.Task] = {}
 
@@ -630,12 +686,10 @@ async def run_peer(ctx: PeerContext):
     async def make_pc(remote_id: str) -> RTCPeerConnection:
         pc = RTCPeerConnection(cfg)
 
-        # Локальный микрофон во все pc
         sender: Optional[RTCRtpSender] = None
         if sender is None:
             sender = pc.addTrack(mic)
 
-        # Приходящие ICE → адресно
         @pc.on("icecandidate")
         async def on_ice(candidate):
             if candidate is None:
@@ -643,7 +697,6 @@ async def run_peer(ctx: PeerContext):
                 return
             cand_sdp = candidate.to_sdp()
             ip = _extract_ip_from_candidate(cand_sdp) or ""
-            # фильтруем мусорные
             bad = (ip.startswith("127.") or ip.startswith("169.254.") or ip.startswith("192.168.56.") or (".local" in cand_sdp))
             if bad:
                 log.info("[ICE] skip %s", cand_sdp)
@@ -658,7 +711,6 @@ async def run_peer(ctx: PeerContext):
                 },
             }))
 
-        # Получение аудио-дорожки
         @pc.on("track")
         async def on_track(track):
             if track.kind != "audio":
@@ -689,7 +741,6 @@ async def run_peer(ctx: PeerContext):
         my_id = hello["id"]
         roster = [p["id"] for p in hello.get("roster", []) if p["id"] != my_id]
 
-        # Отправляем своё имя (если задано)
         if ctx.name:
             try:
                 await ws.send(json.dumps({"type": "name", "name": ctx.name}))
@@ -697,7 +748,6 @@ async def run_peer(ctx: PeerContext):
                 pass
             log.info("[USER] name sent: %s", ctx.name)
 
-        # Правило чтобы избежать glare: инициатор — у кого меньший id
         async def maybe_call(remote_id: str):
             if my_id < remote_id:
                 pc = pcs.get(remote_id) or await make_pc(remote_id)
@@ -707,11 +757,9 @@ async def run_peer(ctx: PeerContext):
                                           "sdp": pc.localDescription.sdp, "sdpType": pc.localDescription.type}))
                 log.info("[PC] Offer → %s", remote_id)
 
-        # Звоним всем уже в комнате по правилу
         for pid in roster:
             await maybe_call(pid)
 
-        # Основной цикл сигналинга
         async for raw in ws:
             data = json.loads(raw)
             typ = data.get("type")
@@ -767,12 +815,15 @@ async def run_peer(ctx: PeerContext):
                 if not cand_sdp or ".local" in cand_sdp:
                     continue
                 try:
-                    candidate_obj = RTCIceCandidate(sdpMid=c.get('sdpMid'), sdpMLineIndex=c.get('sdpMLineIndex'), candidate=cand_sdp)
+                    candidate_obj = RTCIceCandidate(
+                        sdpMid=c.get('sdpMid'),
+                        sdpMLineIndex=c.get('sdpMLineIndex'),
+                        candidate=cand_sdp
+                    )
                     await pc.addIceCandidate(candidate_obj)
                 except Exception as e:
                     log.info("[ICE] addIceCandidate error: %s (cand=%s)", e, c)
 
-        # WS закрыт
         for pid in list(pcs.keys()):
             await close_peer(pid)
         await mic.stop()
@@ -780,7 +831,7 @@ async def run_peer(ctx: PeerContext):
         player.close()
         log.info("[PC] Closed all")
 
-# ─── Экспортируем то, что использует GUI ───────────────────────────
+# ─── Экспортируем ──────────────────────────────────────────────────
 __all__ = [
     "HTTP_PORT",
     "PeerContext",

@@ -48,6 +48,7 @@
       const hue = (p.x / W) * 360;
       ctx.beginPath();
       ctx.fillStyle = `hsla(${hue}, 90%, 60%, ${p.a})`;
+
       ctx.arc(p.x, p.y, p.rCss * DPR, 0, Math.PI * 2);
       ctx.fill();
     }
@@ -85,6 +86,7 @@ function toast(text, type = "info") {
     setTimeout(() => box.remove(), 400);
   }, 3500);
 }
+
 
 // Ripple на кнопках (один набор обработчиков)
 document.addEventListener(
@@ -369,6 +371,7 @@ function appendChat({ from: fromId, name, text, ts }) {
   meta.className = "meta";
   const who = name ? name : fromId ? fromId.slice(0, 6) : "anon";
   meta.textContent = `${who} · ${fmtTime(ts)}`;
+
   const body = document.createElement("span");
   body.className = "body";
   body.textContent = " " + text;
@@ -437,61 +440,53 @@ function maskToken(t) {
 function currentToken() {
   return localStorage.getItem("ROOM_TOKEN") || "";
 }
+let reconnectTimer = null;
+
+function scheduleReconnect() {
+  if (!joined) return;                 // не лезем, если пользователь вышел
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    initWS();                          // пересоздаём ws
+    waitWsOpen(6000).catch(() => {});  // не шумим тостами тут
+  }, 800); // лёгкий бэкофф
+}
+
 
 function initWS() {
-  // закрыть старый сокет
   try {
     if (ws) {
       ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
       ws.close(4000, "reconnect");
     }
   } catch {}
-
-  // Чистим локальные peer-состояния (без трогания UI статуса пользователя)
   closeAllPeers();
 
   const token = currentToken();
-  if (!token) {
-    setState("Требуется токен", "warn");
-    toast("Не задан токен комнаты", "warn");
-    ws = null;
-    return;
-  }
+  if (!token) { setState("Требуется токен", "warn"); ws = null; return; }
 
-  const url =
-    (location.protocol === "https:" ? "wss://" : "ws://") +
-    location.host +
-    "/ws?t=" +
-    encodeURIComponent(token);
+  // Если страница по https — используем wss, иначе ws
+  const scheme = (location.protocol === "https:") ? "wss://" : "ws://";
+  // Дублируем токен и в query, и в subprotocol — чтобы пройти и через хитрые прокси
+  const url = scheme + location.host + "/ws?t=" + encodeURIComponent(token);
 
-  ws = new WebSocket(url);
+  // Передаём два варианта: "token.<…>" и голый токен (некоторые прокси чистят точку)
+  ws = new WebSocket(url, ["token." + currentToken()]);
 
-  ws.onopen = () => {
-    setState("Соединение установлено", "ok");
-  };
 
+  ws.onopen = () => { setState("Соединение установлено", "ok"); };
   ws.onclose = (e) => {
-    // 1006 — abnormal closure, не 401
-    if (e.code === 4401 || e.code === 4003) {
-      setState("401 Unauthorized", "error");
-      toast("401 Unauthorized", "error");
-    } else if (e.code === 4001) {
-      setState("Комната заполнена", "warn");
-    } else {
-      setState("Соединение закрыто", "warn");
-    }
+    console.warn("[WS close]", e.code, e.reason);
+    setState("Соединение закрыто", "warn");
+    scheduleReconnect();
   };
-
-  ws.onerror = () => {
-    if (ws && ws.readyState === WebSocket.CLOSED) {
-      setState("Ошибка соединения", "error");
-    } else {
-      setState("Ошибка соединения", "error");
-    }
+  ws.onerror = (e) => {
+    console.error("[WS error]", e);
+    setState("Ошибка соединения", "error");
   };
-
   ws.onmessage = onWSMessage;
 }
+
 
 function addPeerUI(id, name) {
   if (!peersEl || !tpl) return;
