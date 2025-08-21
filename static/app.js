@@ -262,8 +262,8 @@
     chatLog.scrollTop = chatLog.scrollHeight;
   }
   function sendChat(){
-    const text = (chatInput.value||"").trim();
-    if(!text) return;
+    const text = (chatInput.value || "").slice(0,500).trim();
+    if(!text || ws.readyState !== WebSocket.OPEN) return;
     const mentions = extractMentions(text);
     ws.send(JSON.stringify({type:"chat", text, mentions}));
     chatInput.value = "";
@@ -290,10 +290,31 @@
   }
 
   // создаём WS
-  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  const token = localStorage.getItem('ROOM_TOKEN') || '';
+  let ws;
+  if (token) {
+    ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws?t=' + encodeURIComponent(token));
+  } else {
+    setState('Требуется токен', 'warn');
+    toast('Не задан токен комнаты', 'warn');
+    ws = {send() {}, addEventListener() {}, close() {}, readyState: WebSocket.CLOSED};
+  }
   ws.addEventListener('open', () => setState('Соединение установлено', 'ok'));
-  ws.addEventListener('close', () => setState('Соединение закрыто', 'warn'));
-  ws.addEventListener('error', () => setState('Ошибка соединения', 'error'));
+  ws.addEventListener('close', (e) => {
+    if (e.code === 1006 && token) {
+      setState('401 Unauthorized', 'error');
+      toast('401 Unauthorized', 'error');
+    } else {
+      setState('Соединение закрыто', 'warn');
+    }
+  });
+  ws.addEventListener('error', () => {
+    if (ws.readyState === WebSocket.CLOSED && token) {
+      setState('401 Unauthorized', 'error');
+    } else {
+      setState('Ошибка соединения', 'error');
+    }
+  });
 
   function addPeerUI(id, name) {
     if (document.getElementById('peer-' + id)) return;
@@ -350,7 +371,7 @@
     };
 
     pc.onicecandidate = (e) => {
-      ws.send(JSON.stringify({ type:'ice', to:remoteId, candidate: e.candidate ? {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type:'ice', to:remoteId, candidate: e.candidate ? {
         candidate: e.candidate.candidate, sdpMid: e.candidate.sdpMid, sdpMLineIndex: e.candidate.sdpMLineIndex
       } : null }));
     };
@@ -362,7 +383,7 @@
       const pc = pcs.get(remoteId) || makePC(remoteId);
       const off = await pc.createOffer();
       await pc.setLocalDescription(off);
-      ws.send(JSON.stringify({ type:'offer', to:remoteId, sdp:pc.localDescription.sdp, sdpType:pc.localDescription.type }));
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type:'offer', to:remoteId, sdp:pc.localDescription.sdp, sdpType:pc.localDescription.type }));
     }
   }
 
@@ -396,7 +417,7 @@
       await pc.setRemoteDescription({ type:'offer', sdp:m.sdp });
       const ans = await pc.createAnswer();
       await pc.setLocalDescription(ans);
-      ws.send(JSON.stringify({ type:'answer', to:from, sdp:pc.localDescription.sdp, sdpType:pc.localDescription.type }));
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type:'answer', to:from, sdp:pc.localDescription.sdp, sdpType:pc.localDescription.type }));
       return;
     }
     if (m.type === 'answer') {
@@ -453,6 +474,11 @@
     try {
       setState('Запрашиваем микрофон…', 'idle');
       micStream = await navigator.mediaDevices.getUserMedia({ audio:true });
+      if (ws.readyState !== WebSocket.OPEN) {
+        toast('Нет соединения', 'error');
+        setState('Нет соединения', 'error');
+        return;
+      }
       ws.send(JSON.stringify({ type:'name', name: (nameEl.value || 'User').slice(0, 32) }));
       joined = true;
       // Позвонить всем уже видимым

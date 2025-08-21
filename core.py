@@ -81,6 +81,11 @@ MAX_PEERS: int = 2
 # Разрешать только браузерные подключения к /ws
 REJECT_NON_BROWSER: bool = True
 
+# Разрешённые Origin'ы (CSV в env)
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+# Токен комнаты
+ROOM_TOKEN = os.environ.get("ROOM_TOKEN", "")
+
 # ─── Утилиты ────────────────────────────────────────────────────────
 def get_local_ip() -> str:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -308,8 +313,26 @@ async def http_healthz(request):
     return web.Response(text="ok")
 
 async def http_status(request):
-    # теперь отдаём ещё и текущую вместимость
-    return web.json_response({"peers": len(ROOM["peers"]), "capacity": MAX_PEERS, "ok": True})
+    if os.environ.get("ADMIN_STATUS") == "1":
+        secret = os.environ.get("STATUS_SECRET", "")
+        if secret and request.headers.get("X-Status-Secret") == secret:
+            return web.json_response({"peers": len(ROOM["peers"]), "capacity": MAX_PEERS, "ok": True})
+    return web.json_response({"ok": True})
+
+
+@web.middleware
+async def security_headers_mw(request, handler):
+    resp = await handler(request)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("Permissions-Policy", "microphone=()")
+    csp = "default-src 'self'; img-src 'self' data:; style-src 'self'; connect-src 'self' wss:;"
+    if "Content-Security-Policy" in resp.headers:
+        resp.headers["Content-Security-Policy"] = resp.headers["Content-Security-Policy"] + "; " + csp
+    else:
+        resp.headers["Content-Security-Policy"] = csp
+    return resp
 
 # ─── Комната и адресный WS-сигналинг ───────────────────────────────
 # ROOM: peers -> id: ws, names -> id: display name
@@ -340,17 +363,26 @@ def _is_browser(request) -> bool:
     browser_markers = ("mozilla", "chrome", "safari", "firefox", "edg", "opr", "mobile")
     return any(m in ua for m in browser_markers)
 
+
 async def http_ws(request):
-    ws = web.WebSocketResponse()
+    origin = request.headers.get("Origin")
+    if ALLOWED_ORIGINS and origin not in ALLOWED_ORIGINS:
+        log.warning("[WS] forbidden Origin: %s", origin)
+        return web.Response(status=403, text="Forbidden")
+
+    token = request.query.get("t")
+    if not token or token != ROOM_TOKEN:
+        log.warning("[WS] unauthorized token from %s", request.remote)
+        return web.Response(status=401, text="Unauthorized")
+
+    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=65536)
     await ws.prepare(request)
 
-    # Только браузеры
     if not _is_browser(request):
         await ws.send_json({"type": "browser-only", "reason": "Please join from a web browser"})
         await ws.close()
         return ws
 
-    # Лимит вместимости (устанавливается при старте сервера из GUI)
     if len(ROOM["peers"]) >= MAX_PEERS:
         await ws.send_json({"type": "full", "capacity": MAX_PEERS})
         await ws.close()
@@ -363,11 +395,29 @@ async def http_ws(request):
     await _broadcast({"type": "peer-joined", "id": pid}, exclude=pid)
     log.info("[WS] peer joined: %s (total=%d)", pid, len(ROOM["peers"]))
 
+    last_ts = 0
+    msg_count = 0
+
     try:
         async for msg in ws:
+            now = int(time.time())
+            if now != last_ts:
+                last_ts = now
+                msg_count = 0
+            if msg_count >= 20:
+                if msg_count == 20:
+                    log.warning("[WS] rate limit exceeded for %s", pid)
+                continue
+            msg_count += 1
+
             if msg.type == web.WSMsgType.TEXT:
-                data = json.loads(msg.data)
+                try:
+                    data = json.loads(msg.data)
+                except Exception:
+                    continue
                 typ = data.get("type")
+                if typ not in {"name", "chat", "offer", "answer", "ice"}:
+                    continue
 
                 if typ == "name":
                     ROOM["names"][pid] = data.get("name", "")[:64]
@@ -380,24 +430,46 @@ async def http_ws(request):
                     })
 
                 elif typ == "chat":
-                    text = (data.get("text") or "").strip()
-                    if text:
-                        payload = {
-                            "type": "chat",
-                            "from": pid,
-                            "name": ROOM["names"].get(pid, ""),
-                            "text": text,
-                            "ts": int(time.time() * 1000),
-                        }
-                        await _broadcast(payload)
+                    text = (data.get("text") or "").strip()[:500]
+                    if not text:
+                        continue
+                    payload = {
+                        "type": "chat",
+                        "from": pid,
+                        "name": ROOM["names"].get(pid, ""),
+                        "text": text,
+                        "ts": int(time.time() * 1000),
+                    }
+                    await _broadcast(payload)
 
-                elif typ in {"offer", "answer", "ice"}:
+                elif typ in {"offer", "answer"}:
                     to = data.get("to")
                     if to and to in ROOM["peers"]:
-                        data = dict(data)
-                        data["from"] = pid
+                        payload = {
+                            "type": typ,
+                            "from": pid,
+                            "to": to,
+                            "sdp": data.get("sdp"),
+                            "sdpType": data.get("sdpType"),
+                        }
                         try:
-                            await ROOM["peers"][to].send_str(json.dumps(data))
+                            await ROOM["peers"][to].send_json(payload)
+                        except Exception:
+                            pass
+
+                elif typ == "ice":
+                    to = data.get("to")
+                    if to and to in ROOM["peers"]:
+                        payload = {
+                            "type": "ice",
+                            "from": pid,
+                            "to": to,
+                            "candidate": data.get("candidate"),
+                            "sdpMid": data.get("sdpMid"),
+                            "sdpMLineIndex": data.get("sdpMLineIndex"),
+                        }
+                        try:
+                            await ROOM["peers"][to].send_json(payload)
                         except Exception:
                             pass
 
@@ -413,7 +485,6 @@ async def http_ws(request):
         await _broadcast({"type": "peer-left", "id": pid})
         log.info("[WS] peer left: %s (total=%d)", pid, len(ROOM["peers"]))
 
-    # ВАЖНО: всегда возвращаем ws, чтобы не получить AttributeError в aiohttp
     return ws
 
 
@@ -421,7 +492,7 @@ async def start_http_server(max_peers: int = 2):
     """Старт HTTP/WS сервера. Лимит участников задаётся параметром, по умолчанию 2."""
     global MAX_PEERS
     MAX_PEERS = max(1, min(10, int(max_peers)))
-    app = web.Application()
+    app = web.Application(middlewares=[security_headers_mw])
     app.add_routes([
         web.get("/", http_index),
         web.get("/style.css", http_style),
