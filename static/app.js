@@ -417,8 +417,25 @@ saveTokenBtn?.addEventListener("click", () => {
   initWS(); // переподключение
 });
 
-const pcs = new Map();   // id -> RTCPeerConnection
+const pcs = new Map();    // id -> RTCPeerConnection
 const audios = new Map(); // id -> <audio>
+const pendingIce = new Map(); // id -> Array<candidate>
+
+function queueIce(id, c) {
+  if (!pendingIce.has(id)) pendingIce.set(id, []);
+  pendingIce.get(id).push(c);
+}
+async function flushQueuedIce(id) {
+  const pc = pcs.get(id);
+  if (!pc || !pc.remoteDescription) return;
+  const list = pendingIce.get(id) || [];
+  for (const c of list) {
+    try { await pc.addIceCandidate(c); }
+    catch (e) { console.warn("[ICE] late add failed", e); }
+  }
+  pendingIce.delete(id);
+}
+
 const audioOutSel = document.getElementById("audio-output");
 let selectedAudioOutput = "";
 
@@ -464,6 +481,7 @@ audioOutSel?.addEventListener("change", () => {
   selectedAudioOutput = audioOutSel.value;
   audios.forEach((a) => setAudioOutput(a));
 });
+
 let myId = null;
 let joined = false;
 let micStream = null;
@@ -485,6 +503,7 @@ function maskToken(t) {
 function currentToken() {
   return localStorage.getItem("ROOM_TOKEN") || "";
 }
+
 let reconnectTimer = null;
 
 function scheduleReconnect() {
@@ -496,7 +515,6 @@ function scheduleReconnect() {
     waitWsOpen(6000).catch(() => {});  // не шумим тостами тут
   }, 800); // лёгкий бэкофф
 }
-
 
 function initWS() {
   try {
@@ -515,9 +533,8 @@ function initWS() {
   // Дублируем токен и в query, и в subprotocol — чтобы пройти и через хитрые прокси
   const url = scheme + location.host + "/ws?t=" + encodeURIComponent(token);
 
-  // Передаём два варианта: "token.<…>" и голый токен (некоторые прокси чистят точку)
+  // Передаём вариант subprotocol: "token.<…>"
   ws = new WebSocket(url, ["token." + currentToken()]);
-
 
   ws.onopen = () => { setState("Соединение установлено", "ok"); };
   ws.onclose = (e) => {
@@ -531,7 +548,6 @@ function initWS() {
   };
   ws.onmessage = onWSMessage;
 }
-
 
 function addPeerUI(id, name) {
   if (!peersEl || !tpl) return;
@@ -705,21 +721,46 @@ async function onWSMessage(ev) {
     return;
   }
 
+  // === Perfect Negotiation (glare-handling) ===
   if (m.type === "offer") {
     const from = m.from;
     const pc = pcs.get(from) || makePC(from);
-    await pc.setRemoteDescription({ type: "offer", sdp: m.sdp });
-    const ans = await pc.createAnswer();
-    await pc.setLocalDescription(ans);
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(
-        JSON.stringify({
-          type: "answer",
-          to: from,
-          sdp: pc.localDescription.sdp,
-          sdpType: pc.localDescription.type,
-        })
-      );
+
+    // Роль «вежливый/невежливый» — для устойчивого разруливания двусторонних офферов
+    const polite = myId > from; // у кого id больше — тот «polite»
+
+    try {
+      if (pc.signalingState === "have-local-offer") {
+        // Коллизия офферов (glare)
+        if (!polite) {
+          console.warn("[SIG] glare: impolite side ignores incoming offer");
+          return; // невежливый сохраняет свой локальный оффер
+        }
+        // Вежливый откатывает свой локальный оффер и принимает удалённый
+        await pc.setLocalDescription({ type: "rollback" });
+      }
+
+      await pc.setRemoteDescription({ type: "offer", sdp: m.sdp });
+
+      const ans = await pc.createAnswer();
+      await pc.setLocalDescription(ans);
+
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(
+          JSON.stringify({
+            type: "answer",
+            to: from,
+            sdp: pc.localDescription.sdp,
+            sdpType: pc.localDescription.type,
+          })
+        );
+      }
+
+      // Применить отложенные ICE после установки удалённого оффера
+      flushQueuedIce(from);
+
+    } catch (e) {
+      console.warn("[SIG] offer handling failed:", e, "state=", pc.signalingState);
     }
     return;
   }
@@ -727,7 +768,17 @@ async function onWSMessage(ev) {
   if (m.type === "answer") {
     const pc = pcs.get(m.from);
     if (!pc) return;
-    await pc.setRemoteDescription({ type: "answer", sdp: m.sdp });
+
+    // Принимать answer только когда ожидаем его после локального оффера
+    if (pc.signalingState !== "have-local-offer") {
+      console.warn("[SIG] late/duplicate answer ignored, state=", pc.signalingState);
+      return;
+    }
+    try {
+      await pc.setRemoteDescription({ type: "answer", sdp: m.sdp });
+    } catch (e) {
+      console.warn("[SIG] setRemoteDescription(answer) failed:", e, "state=", pc.signalingState);
+    }
     return;
   }
 
@@ -735,16 +786,19 @@ async function onWSMessage(ev) {
     const pc = pcs.get(m.from);
     if (!pc) return;
     const c = m.candidate;
+
     if (c === null) {
-      try {
-        await pc.addIceCandidate(null);
-      } catch {}
+      try { await pc.addIceCandidate(null); } catch {}
       return;
     }
     if (!c.candidate || c.candidate.includes(".local")) return;
-    try {
-      await pc.addIceCandidate(c);
-    } catch {}
+
+    // Если ещё нет remoteDescription — копим кандидаты
+    if (!pc.remoteDescription) {
+      queueIce(m.from, c);
+      return;
+    }
+    try { await pc.addIceCandidate(c); } catch (e) { console.warn("[ICE] add failed", e); }
     return;
   }
 
@@ -821,7 +875,6 @@ async function waitWsOpen(timeoutMs = 6000) {
   });
 }
 
-
 async function startCall() {
   if (!currentToken()) {
     toast("Не задан токен комнаты", "warn");
@@ -873,7 +926,7 @@ async function startCall() {
   joined = true;
   callAllKnownPeers();
 
-  // Если в DOM уже есть карточки из прежней сессии
+  // Если в DOM уже есть карточки из прежней сессии — дозвонимся
   $$(".peer").forEach((el) => {
     const id = el.id.replace("peer-", "");
     if (id && !pcs.has(id)) maybeCall(id);
@@ -910,7 +963,6 @@ async function leaveCall() {
     switchJoinButton("join");
   }
 }
-
 
 /* =========================================================================
    Инициализация и единые обработчики

@@ -80,7 +80,7 @@ class AudioSettings:
 AUDIO_SETTINGS = AudioSettings()
 
 # ─── Глобальные параметры сигналинга ────────────────────────────────
-MAX_PEERS: int = 2                              # лимит участников комнаты
+MAX_PEERS: int = 10                              # лимит участников комнаты
 REJECT_NON_BROWSER: bool = True                 # пускать только браузеры
 
 # Разрешённые Origin'ы (CSV в env)
