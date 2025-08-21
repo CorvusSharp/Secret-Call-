@@ -1,7 +1,0 @@
-<resources>
-    <string name="app_name">AndroidCall</string>
-    <string name="join">Join</string>
-    <string name="leave">Leave</string>
-    <string name="name_hint">Name</string>
-    <string name="token_hint">Token</string>
-</resources>

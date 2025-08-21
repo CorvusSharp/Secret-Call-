@@ -367,17 +367,7 @@ def _is_browser(request) -> bool:
     markers = ("mozilla", "chrome", "safari", "firefox", "edg", "opr", "mobile")
     return any(m in ua for m in markers)
 
-
 async def http_ws(request):
-    """
-    WebSocket-сигналинг:
-      — Origin whitelist (ALLOWED_ORIGINS)
-      — Токен комнаты (ROOM_TOKEN) через subprotocol "token.<TOKEN>" или query ?t=TOKEN
-      — Проверка, что клиент — браузер
-      — Лимит вместимости
-      — Эхо-возврат выбранного subprotocol (обязательно для Chrome)
-      — Адресный сигналинг (offer/answer/ice) + чат + обновление имён
-    """
     # ── Origin whitelist ─────────────────────────────────────────────
     origin = request.headers.get("Origin")
     if ALLOWED_ORIGINS and origin not in ALLOWED_ORIGINS:
@@ -389,10 +379,8 @@ async def http_ws(request):
     offered = (request.headers.get("Sec-WebSocket-Protocol") or "")
     offered_items = [x.strip() for x in offered.split(",") if x.strip()]
 
-    # Нормализуем токен и запомним фактический элемент, который надо вернуть в ответе
-    proto_token = None     # нормализованное значение токена (expected)
-    matched_item = None    # строка из offered_items, которую вернём клиенту
-
+    proto_token = None
+    matched_item = None
     for item in offered_items:
         if expected:
             if item == expected:
@@ -404,27 +392,23 @@ async def http_ws(request):
                 matched_item = item
                 break
         else:
-            # dev/локалка: без ROOM_TOKEN можно принять первый непустой
             if item and item != "null":
                 proto_token = item
                 matched_item = item
                 break
 
-    # fallback: токен в query (?t=...)
     qtok = request.query.get("t", "")
 
-    # Решение по аутентификации
     authed = False
     if expected:
-        # Требуем ровно expected где-то (в subprotocol или в query)
         if proto_token == expected or qtok == expected:
             authed = True
     else:
-        # Без ROOM_TOKEN пропускаем всех
         authed = True
 
     if not authed:
-        log.warning("[WS] unauthorized token from %s (offered=%s, qtok=%s)", request.remote, offered_items, qtok)
+        log.warning("[WS] unauthorized token from %s (offered=%s, qtok=%s)",
+                    request.remote, offered_items, qtok)
         return web.Response(status=401, text="Unauthorized")
 
     # ── Только браузеры ──────────────────────────────────────────────
@@ -443,25 +427,11 @@ async def http_ws(request):
         await ws_tmp.close()
         return ws_tmp
 
-    # ── Негациация субпротокола (критично для Chrome) ────────────────
-    # Если клиент прислал список протоколов, сервер ДОЛЖЕН выбрать один и вернуть его.
-    selected_proto = None
-    if offered_items:
-        if matched_item:
-            selected_proto = matched_item                         # эхо-возвращаем ровно принятый элемент
-        elif not expected:
-            selected_proto = offered_items[0]                     # dev-режим — вернём первый предложенный
-        else:
-            # ROOM_TOKEN задан, но аутентификация прошла по query (?t=...);
-            # Chrome всё равно ждёт echo выбора subprotocol → вернём первый.
-            selected_proto = offered_items[0]
-
-    if selected_proto:
-        ws = web.WebSocketResponse(
-            heartbeat=20,
-            max_msg_size=MAX_MSG_SIZE,
-            protocols=[selected_proto],  # ← ВАЖНО: без этого Chrome нередко даёт 1006
-        )
+    # ── Эхо выбора субпротокола (важно для Chrome) ───────────────────
+    if matched_item:
+        ws = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_MSG_SIZE, protocols=[matched_item])
+    elif offered_items:
+        ws = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_MSG_SIZE, protocols=[offered_items[0]])
     else:
         ws = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_MSG_SIZE)
 
@@ -475,7 +445,7 @@ async def http_ws(request):
     await _broadcast({"type": "peer-joined", "id": pid}, exclude=pid)
     log.info("[WS] peer joined: %s (total=%d)", pid, len(ROOM["peers"]))
 
-    # ── Простой антифлуд ─────────────────────────────────────────────
+    # ── Антифлуд ─────────────────────────────────────────────────────
     last_ts = 0
     msg_count = 0
 
@@ -491,73 +461,61 @@ async def http_ws(request):
                 continue
             msg_count += 1
 
-            if msg.type == web.WSMsgType.TEXT:
-                try:
-                    data = json.loads(msg.data)
-                except Exception:
+            if msg.type != web.WSMsgType.TEXT:
+                if msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
+                    break
+                continue
+
+            try:
+                data = json.loads(msg.data)
+            except Exception:
+                continue
+
+            typ = data.get("type")
+            if typ not in {"name", "chat", "offer", "answer", "ice", "key", "chat-e2e"}:
+                continue
+
+            if typ == "name":
+                ROOM["names"][pid] = (data.get("name", "") or "")[:MAX_NAME_LEN]
+                await _broadcast({
+                    "type": "roster",
+                    "roster": [{"id": p, "name": ROOM["names"].get(p, "")} for p in ROOM["peers"].keys()],
+                })
+                continue
+
+            if typ == "chat":
+                text = (data.get("text") or "").strip()[:MAX_CHAT_LEN]
+                if not text:
                     continue
+                payload = {
+                    "type": "chat",
+                    "from": pid,
+                    "name": ROOM["names"].get(pid, ""),
+                    "text": text,
+                    "ts": int(time.time() * 1000),
+                }
+                await _broadcast(payload)
+                continue
 
-                typ = data.get("type")
-                if typ not in {"name", "chat", "offer", "answer", "ice"}:
+            # ── ЕДИНЫЙ путь пересылки offer/answer/ice ───────────────
+            if typ in {"offer", "answer", "ice", "key", "chat-e2e"}:
+                to_id = data.get("to")
+                if not to_id or to_id not in ROOM["peers"]:
                     continue
-
-                if typ == "name":
-                    ROOM["names"][pid] = (data.get("name", "") or "")[:MAX_NAME_LEN]
-                    await _broadcast({
-                        "type": "roster",
-                        "roster": [{"id": p, "name": ROOM["names"].get(p, "")} for p in ROOM["peers"].keys()],
-                    })
-
-                elif typ == "chat":
-                    text = (data.get("text") or "").strip()[:MAX_CHAT_LEN]
-                    if not text:
+                if typ == "ice":
+                    cand = data.get("candidate", None)
+                    if cand is not None and not isinstance(cand, dict):
                         continue
-                    payload = {
-                        "type": "chat",
-                        "from": pid,
-                        "name": ROOM["names"].get(pid, ""),
-                        "text": text,
-                        "ts": int(time.time() * 1000),
-                    }
-                    await _broadcast(payload)
-
-                elif typ in {"offer", "answer"}:
-                    to = data.get("to")
-                    if to and to in ROOM["peers"]:
-                        sdp = data.get("sdp")
-                        sdp_type = data.get("sdpType")
-                        if not isinstance(sdp, str) or not sdp:
-                            continue
-                        payload = {"type": typ, "from": pid, "to": to, "sdp": sdp, "sdpType": sdp_type}
-                        try:
-                            await ROOM["peers"][to].send_json(payload)
-                        except Exception:
-                            pass
-
-                elif typ == "ice":
-                    to = data.get("to")
-                    if to and to in ROOM["peers"]:
-                        cand = data.get("candidate")
-                        if cand is not None and not isinstance(cand, dict):
-                            continue
-                        payload = {
-                            "type": "ice",
-                            "from": pid,
-                            "to": to,
-                            "candidate": cand,
-                            "sdpMid": data.get("sdpMid"),
-                            "sdpMLineIndex": data.get("sdpMLineIndex"),
-                        }
-                        try:
-                            await ROOM["peers"][to].send_json(payload)
-                        except Exception:
-                            pass
-
-            elif msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
-                break
+                payload = dict(data)
+                payload["from"] = pid  # кто отправил
+                try:
+                    await ROOM["peers"][to_id].send_json(payload)
+                    log.info("[WS→%s] %s (from=%s)", to_id, typ, pid)
+                except Exception as e:
+                    log.warning("[WS] forward %s to %s failed: %s", typ, to_id, e)
+                continue
 
     finally:
-        # ── Очистка ──────────────────────────────────────────────────
         try:
             await ws.close()
         except Exception:
@@ -578,14 +536,15 @@ async def start_http_server(max_peers: int = 2):
     app = web.Application(middlewares=[security_headers_mw])
     app.add_routes([
         web.get("/", http_index),
-        web.get("/style.css", http_style),
-        web.get("/icon.svg", http_icon),
-        web.get("/app.js", http_app),
-        web.get("/favicon.ico", http_icon),
         web.get("/ws", http_ws),
         web.get("/healthz", http_healthz),
         web.get("/status", http_status),
+        web.get("/app.js", http_app),           # можно оставить
+        web.get("/style.css", http_style),
+        web.get("/icon.svg", http_icon),
     ])
+    app.router.add_static("/js/", path=str(STATIC_DIR / "js"), show_index=False)
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", HTTP_PORT)
@@ -683,42 +642,78 @@ async def run_peer(ctx: PeerContext):
         if t:
             t.cancel()
 
-    async def make_pc(remote_id: str) -> RTCPeerConnection:
-        pc = RTCPeerConnection(cfg)
+async def make_pc(remote_id: str) -> RTCPeerConnection:
+    pc = RTCPeerConnection(cfg)
 
-        sender: Optional[RTCRtpSender] = None
-        if sender is None:
-            sender = pc.addTrack(mic)
+    # Добавляем микрофонный трек
+    try:
+        # Создаем кастомный MediaStreamTrack для аудио
+        class AudioStreamTrack(MediaStreamTrack):
+            kind = "audio"
+            
+            def __init__(self):
+                super().__init__()
+                self.mic = MicTrack()
+                self._running = True
+                
+            async def recv(self):
+                if not self._running:
+                    raise MediaStreamError("Track stopped")
+                try:
+                    audio_data = await self.mic.recv()
+                    frame = AudioFrame.from_ndarray(
+                        np.frombuffer(audio_data, dtype=np.int16).reshape(-1, 1), 
+                        sample_rate=SAMPLE_RATE
+                    )
+                    return frame
+                except Exception as e:
+                    log.error(f"[AUDIO] Error in recv: {e}")
+                    raise MediaStreamError(f"Audio error: {e}")
+            
+            async def stop(self):
+                self._running = False
+                await self.mic.stop()
+                await super().stop()
+        
+        # Добавляем трек в соединение
+        audio_track = AudioStreamTrack()
+        sender = pc.addTrack(audio_track)
+        
+    except Exception as e:
+        log.error(f"[AUDIO] Failed to create audio track: {e}")
+        # Fallback: добавляем трансмиттер без трека
+        pc.addTransceiver("audio", direction="sendrecv")
 
-        @pc.on("icecandidate")
-        async def on_ice(candidate):
-            if candidate is None:
-                await ws.send(json.dumps({"type": "ice", "to": remote_id, "candidate": None}))
-                return
-            cand_sdp = candidate.to_sdp()
-            ip = _extract_ip_from_candidate(cand_sdp) or ""
-            bad = (ip.startswith("127.") or ip.startswith("169.254.") or ip.startswith("192.168.56.") or (".local" in cand_sdp))
-            if bad:
-                log.info("[ICE] skip %s", cand_sdp)
-                return
-            await ws.send(json.dumps({
-                "type": "ice",
-                "to": remote_id,
-                "candidate": {
-                    "candidate": cand_sdp,
-                    "sdpMid": getattr(candidate, "sdpMid", "0"),
-                    "sdpMLineIndex": getattr(candidate, "sdpMLineIndex", 0),
-                },
-            }))
+    @pc.on("icecandidate")
+    async def on_ice(candidate):
+        if candidate is None:
+            await ws.send(json.dumps({"type": "ice", "to": remote_id, "candidate": None}))
+            return
+        cand_sdp = candidate.to_sdp()
+        ip = _extract_ip_from_candidate(cand_sdp) or ""
+        bad = (ip.startswith("127.") or ip.startswith("169.254.") or ip.startswith("192.168.56.") or (".local" in cand_sdp))
+        if bad:
+            log.info("[ICE] skip %s", cand_sdp)
+            return
+        await ws.send(json.dumps({
+            "type": "ice",
+            "to": remote_id,
+            "candidate": {
+                "candidate": cand_sdp,
+                "sdpMid": getattr(candidate, "sdpMid", "0"),
+                "sdpMLineIndex": getattr(candidate, "sdpMLineIndex", 0),
+            },
+        }))
 
-        @pc.on("track")
-        async def on_track(track):
-            if track.kind != "audio":
-                return
-            mixer.register_peer(remote_id)
-            resampler = AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
-            async def pump():
-                while True:
+    @pc.on("track")
+    async def on_track(track):
+        if track.kind != "audio":
+            return
+        mixer.register_peer(remote_id)
+        resampler = AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+        async def pump():
+            while True:
+                try:
                     frame = await track.recv()
                     frames = resampler.resample(frame)
                     if not frames:
@@ -729,10 +724,13 @@ async def run_peer(ctx: PeerContext):
                         except Exception:
                             pcm = bytes(f.planes[0])
                         mixer.push(remote_id, pcm)
-            pumps[remote_id] = asyncio.create_task(pump())
+                except Exception as e:
+                    log.error(f"[AUDIO] Error in audio pump: {e}")
+                    break
+        pumps[remote_id] = asyncio.create_task(pump())
 
-        pcs[remote_id] = pc
-        return pc
+    pcs[remote_id] = pc
+    return pc
 
     async with websockets.connect(ctx.ws_url) as ws:
         hello = json.loads(await ws.recv())

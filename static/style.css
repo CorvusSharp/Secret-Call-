@@ -325,3 +325,61 @@ body {
   .statusbar.pretty{ gap:.5rem; }
   .token-pill__label{ display:none; }
 }
+
+/* style.css - добавьте эти стили */
+/* Индикатор активности (VU-meter) */
+.peer__vumeter {
+  height: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 2px;
+  margin: 8px 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.vumeter-bar {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #3BE0A7, #6CE2FF);
+  border-radius: 2px;
+  transition: width 0.1s ease;
+}
+
+.peer.speaking .vumeter-bar {
+  background: linear-gradient(90deg, #FFD56C, #FF6B6B);
+}
+
+/* Анимация для индикатора говорящего */
+@keyframes speak-pulse {
+  0% { opacity: 0.6; }
+  50% { opacity: 1; }
+  100% { opacity: 0.6; }
+}
+
+.peer.speaking {
+  animation: speak-pulse 1s infinite;
+  box-shadow: 0 0 0 2px #FFD56C;
+}
+
+/* Кнопка мута себя */
+#self-mute-row {
+  margin: 12px 0;
+}
+
+#self-mute.btn {
+  width: 100%;
+  justify-content: center;
+}
+
+#self-mute[aria-pressed="true"] {
+  background: #3BE0A7;
+  color: #0A1320;
+}
+
+#self-mute[aria-pressed="true"] .btn__label::before {
+  content: "🔊 ";
+}
+
+#self-mute[aria-pressed="false"] .btn__label::before {
+  content: "🔇 ";
+}
