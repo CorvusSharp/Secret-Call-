@@ -1,4 +1,4 @@
-# secure_call_wss.py
+# core.py 
 # ────────────────────────────────────────────────────────────────────
 # WebRTC аудиозвонок с групповым режимом (mesh до 10 пиров) и адресным сигналингом
 # • HTTP сайт (/, /style.css, /icon.svg) + WS сигналинг на /ws
@@ -52,6 +52,15 @@ FRAME_SAMPLES = 960  # 20 ms @ 48k
 
 LOG_FILE = "securecall_webrtc.log"
 
+# Безопасность / лимиты
+MAX_MSG_SIZE = 64 * 1024  # 64 KB
+MAX_MSGS_PER_SEC = 20     # простой лимит для антифлуда
+MAX_CHAT_LEN = 500
+MAX_NAME_LEN = 64
+
+# peer_id -> (window_start_ts_sec, count) (может использоваться для глобального антифлуда)
+_RATE_BUCKET: Dict[str, tuple[int, int]] = {}
+
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
@@ -83,7 +92,7 @@ REJECT_NON_BROWSER: bool = True
 
 # Разрешённые Origin'ы (CSV в env)
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
-# Токен комнаты
+# Токен комнаты (пустая строка => соединения не будут пущены логикой ниже — выставьте токен!)
 ROOM_TOKEN = os.environ.get("ROOM_TOKEN", "")
 
 # ─── Утилиты ────────────────────────────────────────────────────────
@@ -319,14 +328,13 @@ async def http_status(request):
             return web.json_response({"peers": len(ROOM["peers"]), "capacity": MAX_PEERS, "ok": True})
     return web.json_response({"ok": True})
 
-
 @web.middleware
 async def security_headers_mw(request, handler):
     resp = await handler(request)
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("X-Frame-Options", "DENY")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
-    resp.headers.setdefault("Permissions-Policy", "microphone=()")
+    resp.headers.setdefault("Permissions-Policy", "microphone=(self)")
     csp = "default-src 'self'; img-src 'self' data:; style-src 'self'; connect-src 'self' wss:;"
     if "Content-Security-Policy" in resp.headers:
         resp.headers["Content-Security-Policy"] = resp.headers["Content-Security-Policy"] + "; " + csp
@@ -363,30 +371,40 @@ def _is_browser(request) -> bool:
     browser_markers = ("mozilla", "chrome", "safari", "firefox", "edg", "opr", "mobile")
     return any(m in ua for m in browser_markers)
 
-
 async def http_ws(request):
+    # Origin check (если указан белый список)
     origin = request.headers.get("Origin")
     if ALLOWED_ORIGINS and origin not in ALLOWED_ORIGINS:
         log.warning("[WS] forbidden Origin: %s", origin)
         return web.Response(status=403, text="Forbidden")
 
+    # Token check (?t=...)
     token = request.query.get("t")
-    if not token or token != ROOM_TOKEN:
+    expected = os.environ.get("ROOM_TOKEN", "")
+    if not token or token != expected:
         log.warning("[WS] unauthorized token from %s", request.remote)
         return web.Response(status=401, text="Unauthorized")
 
-    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=65536)
-    await ws.prepare(request)
-
+    # Только браузеры
     if not _is_browser(request):
-        await ws.send_json({"type": "browser-only", "reason": "Please join from a web browser"})
-        await ws.close()
-        return ws
+        # Закрываем без подготовки соединения (или можно отдать текст и закрыть после prepare)
+        ws_tmp = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_MSG_SIZE)
+        await ws_tmp.prepare(request)
+        await ws_tmp.send_json({"type": "browser-only", "reason": "Please join from a web browser"})
+        await ws_tmp.close()
+        return ws_tmp
 
+    # Лимит вместимости
     if len(ROOM["peers"]) >= MAX_PEERS:
-        await ws.send_json({"type": "full", "capacity": MAX_PEERS})
-        await ws.close()
-        return ws
+        ws_tmp = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_MSG_SIZE)
+        await ws_tmp.prepare(request)
+        await ws_tmp.send_json({"type": "full", "capacity": MAX_PEERS})
+        await ws_tmp.close()
+        return ws_tmp
+
+    # Полноценное WS
+    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_MSG_SIZE)
+    await ws.prepare(request)
 
     pid = uuid.uuid4().hex
     ROOM["peers"][pid] = ws
@@ -404,9 +422,10 @@ async def http_ws(request):
             if now != last_ts:
                 last_ts = now
                 msg_count = 0
-            if msg_count >= 20:
-                if msg_count == 20:
+            if msg_count >= MAX_MSGS_PER_SEC:
+                if msg_count == MAX_MSGS_PER_SEC:
                     log.warning("[WS] rate limit exceeded for %s", pid)
+                # Тихо игнорируем
                 continue
             msg_count += 1
 
@@ -420,7 +439,7 @@ async def http_ws(request):
                     continue
 
                 if typ == "name":
-                    ROOM["names"][pid] = data.get("name", "")[:64]
+                    ROOM["names"][pid] = (data.get("name", "") or "")[:MAX_NAME_LEN]
                     await _broadcast({
                         "type": "roster",
                         "roster": [
@@ -430,7 +449,7 @@ async def http_ws(request):
                     })
 
                 elif typ == "chat":
-                    text = (data.get("text") or "").strip()[:500]
+                    text = (data.get("text") or "").strip()[:MAX_CHAT_LEN]
                     if not text:
                         continue
                     payload = {
@@ -445,12 +464,16 @@ async def http_ws(request):
                 elif typ in {"offer", "answer"}:
                     to = data.get("to")
                     if to and to in ROOM["peers"]:
+                        sdp = data.get("sdp")
+                        sdp_type = data.get("sdpType")
+                        if not isinstance(sdp, str) or not sdp:
+                            continue
                         payload = {
                             "type": typ,
                             "from": pid,
                             "to": to,
-                            "sdp": data.get("sdp"),
-                            "sdpType": data.get("sdpType"),
+                            "sdp": sdp,
+                            "sdpType": sdp_type,
                         }
                         try:
                             await ROOM["peers"][to].send_json(payload)
@@ -460,11 +483,14 @@ async def http_ws(request):
                 elif typ == "ice":
                     to = data.get("to")
                     if to and to in ROOM["peers"]:
+                        cand = data.get("candidate")
+                        if cand is not None and not isinstance(cand, dict):
+                            continue
                         payload = {
                             "type": "ice",
                             "from": pid,
                             "to": to,
-                            "candidate": data.get("candidate"),
+                            "candidate": cand,
                             "sdpMid": data.get("sdpMid"),
                             "sdpMLineIndex": data.get("sdpMLineIndex"),
                         }
@@ -486,7 +512,6 @@ async def http_ws(request):
         log.info("[WS] peer left: %s (total=%d)", pid, len(ROOM["peers"]))
 
     return ws
-
 
 async def start_http_server(max_peers: int = 2):
     """Старт HTTP/WS сервера. Лимит участников задаётся параметром, по умолчанию 2."""
