@@ -19,6 +19,10 @@ import uuid
 from pathlib import Path
 from typing import Dict, Optional
 
+import time
+from collections import defaultdict, deque
+from aiohttp import web
+
 from aiohttp import web
 
 # ─── Константы ──────────────────────────────────────────────────────
@@ -37,6 +41,18 @@ MAX_NAME_LEN = 64
 MAX_PEERS: int = 10        # лимит участников комнаты
 
 REJECT_NON_BROWSER: bool = True  # пускать только браузеры
+
+TS_SKEW_SEC = 20           # <= 20 секунд допускаем
+# Глубина памяти по ts для защиты от повторной доставки
+REPLAY_WINDOW = 64         # сколько последних ts держим на отправителя
+
+RL_MAX_REQ = int(os.environ.get("RL_MAX_REQ", "30"))          # запросов
+RL_WINDOW_SEC = int(os.environ.get("RL_WINDOW_SEC", "60"))    # в секундах
+_http_rl = defaultdict(lambda: deque())  # ip -> deque[timestamps]
+
+# replay_guard[room_token][sender_id] = {"last": int, "recent": deque([...])}
+replay_guard = defaultdict(lambda: defaultdict(lambda: {"last": 0, "recent": deque(maxlen=REPLAY_WINDOW)}))
+
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -82,6 +98,38 @@ async def wait_port(host: str, port: int, timeout: float = 2.0) -> bool:
         except OSError:
             await asyncio.sleep(0.1)
     return False
+
+
+def validate_ts(room: str, sender_id: str, ts: int) -> bool:
+    """
+    Возвращает True, если метка времени валидна:
+      - присутствует и является int/float
+      - не выходит за допуск по сдвигу часов
+      - монотонно возрастает для данного sender_id внутри комнаты
+      - не повторяется в недавнем окне (anti-replay)
+    """
+    try:
+        t_client = float(ts) / (1000.0 if ts > 10_000_000_000 else 1.0)  # поддержим ms и sec
+    except Exception:
+        return False
+
+    now = time.time()
+    if abs(now - t_client) > TS_SKEW_SEC:
+        return False
+
+    st = replay_guard[room][sender_id]
+    # жёсткая монотония: новый ts должен быть > последнего
+    if t_client <= st["last"]:
+        return False
+
+    # защита от повторов: точное совпадение ts в окне
+    if st["recent"] and any(abs(t_client - x) < 1e-6 for x in st["recent"]):
+        return False
+
+    st["last"] = t_client
+    st["recent"].append(t_client)
+    return True
+
 
 # ─── UDP discovery ─────────────────────────────────────────────────
 async def udp_discover(timeout=1.0, attempts=3):
@@ -175,6 +223,29 @@ async def security_headers_mw(request, handler):
         resp.headers["Content-Security-Policy"] = csp
     return resp
 
+@web.middleware
+async def rate_limit_mw(request, handler):
+    path = request.path
+    # Ограничиваем только статусные эндпоинты
+    if path not in ("/status", "/healthz"):
+        return await handler(request)
+
+    ip = request.headers.get("X-Forwarded-For", request.remote or "unknown").split(",")[0].strip()
+    now = time.time()
+    dq = _http_rl[ip]
+
+    # выкидываем устаревшие метки
+    while dq and now - dq[0] > RL_WINDOW_SEC:
+        dq.popleft()
+
+    if len(dq) >= RL_MAX_REQ:
+        return web.Response(status=429, text="Too Many Requests")
+
+    dq.append(now)
+    return await handler(request)
+
+
+
 # ─── Комната и адресный WS-сигналинг ───────────────────────────────
 ROOM: Dict[str, Dict] = {"peers": {}, "names": {}}
 
@@ -235,7 +306,6 @@ async def http_ws(request):
 
     authed = (proto_token == expected or qtok == expected) if expected else True
     if not authed:
-        # Не логируем предложенные значения
         log.warning("[WS] unauthorized token from %s", request.remote)
         return web.Response(status=401, text="Unauthorized")
 
@@ -265,8 +335,13 @@ async def http_ws(request):
 
     await ws.prepare(request)
 
+    # 2.1: привязка «room» к WS-сессии + заготовка peer id
+    ws._room_token = matched_item or request.query.get("t", "") or ROOM_TOKEN or "default"
+    ws._peer_id = None
+
     # ── Регистрация пира ─────────────────────────────────────────────
     pid = uuid.uuid4().hex
+    ws._peer_id = pid  # для anti-replay/очистки
     ROOM["peers"][pid] = ws
     roster = [{"id": p, "name": ROOM["names"].get(p, "")} for p in ROOM["peers"].keys()]
     await ws.send_json({"type": "hello", "id": pid, "roster": roster})
@@ -279,9 +354,9 @@ async def http_ws(request):
 
     try:
         async for msg in ws:
-            now = int(time.time())
-            if now != last_ts:
-                last_ts = now
+            now_sec = int(time.time())
+            if now_sec != last_ts:
+                last_ts = now_sec
                 msg_count = 0
             if msg_count >= MAX_MSGS_PER_SEC:
                 if msg_count == MAX_MSGS_PER_SEC:
@@ -301,7 +376,7 @@ async def http_ws(request):
                 continue
 
             typ = data.get("type")
-            # Разрешённые типы (включая safety-ok)
+            # Разрешённые типы
             if typ not in {"name", "chat", "offer", "answer", "ice", "key", "chat-e2e", "safety-ok"}:
                 continue
 
@@ -317,7 +392,6 @@ async def http_ws(request):
                 text = (data.get("text") or "").strip()[:MAX_CHAT_LEN]
                 if not text:
                     continue
-                # Не логируем содержание текста
                 payload = {
                     "type": "chat",
                     "from": pid,
@@ -328,18 +402,25 @@ async def http_ws(request):
                 await _broadcast(payload)
                 continue
 
-            # Адресные сообщения (offer/answer/ice/key/chat-e2e/safety-ok)
+            # Адресные сообщения
             to_id = data.get("to")
             if not to_id or to_id not in ROOM["peers"]:
+                continue
+
+            # 2.2: server-side anti-replay ts check для адресных сообщений
+            room = getattr(ws, "_room_token", "default")
+            sender_id = getattr(ws, "_peer_id", "")
+            ts_val = data.get("ts", 0)
+            if not validate_ts(room, sender_id, ts_val):
+                # log.debug("[anti-replay] drop %s from %s: bad ts=%r", typ, sender_id[:6], ts_val)
                 continue
 
             if typ == "ice":
                 cand = data.get("candidate", None)
                 if cand is not None and not isinstance(cand, dict):
                     continue
-                # не логируем candidate/sdp
+                # candidate/sdp не логируем
 
-            # Пересылаем как есть, но в лог — только тип и короткие id
             payload = dict(data)
             payload["from"] = pid
             try:
@@ -358,7 +439,19 @@ async def http_ws(request):
         await _broadcast({"type": "peer-left", "id": pid})
         log.info("[WS] peer left: %s (total=%d)", pid[:6], len(ROOM["peers"]))
 
+        # 2.3: очистка состояния anti-replay для этого пользователя
+        try:
+            room = getattr(ws, "_room_token", "default")
+            _ = replay_guard.get(room, None)
+            if _ is not None:
+                replay_guard[room].pop(pid, None)
+                if not replay_guard[room]:
+                    replay_guard.pop(room, None)
+        except Exception:
+            pass
+
     return ws
+
 
 # ─── HTTP сервер ───────────────────────────────────────────────────
 async def start_http_server(max_peers: int = 2):
@@ -368,7 +461,7 @@ async def start_http_server(max_peers: int = 2):
     global MAX_PEERS
     MAX_PEERS = max(1, min(10, int(max_peers)))
 
-    app = web.Application(middlewares=[security_headers_mw])
+    app = web.Application(middlewares=[security_headers_mw, rate_limit_mw])
     app.add_routes([
         web.get("/", http_index),
         web.get("/ws", http_ws),
@@ -378,7 +471,6 @@ async def start_http_server(max_peers: int = 2):
         web.get("/style.css", http_style),
         web.get("/icon.svg", http_icon),
     ])
-    # статика для фронтенда (/static/js/*.js и т.д.)
     app.router.add_static("/js/", path=str(STATIC_DIR / "js"), show_index=False)
 
     runner = web.AppRunner(app)
@@ -387,6 +479,7 @@ async def start_http_server(max_peers: int = 2):
     await site.start()
     log.info("[HTTP] http://0.0.0.0:%d (/, /style.css, /app.js, /icon.svg, /ws, /healthz, /status) — capacity=%d",
              HTTP_PORT, MAX_PEERS)
+
 
 # ─── Экспорт ────────────────────────────────────────────────────────
 __all__ = [

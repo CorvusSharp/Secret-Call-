@@ -4,6 +4,15 @@
 import { $, $$, toast, showModal, showNet, hideNet } from "./ui.js";
 import { updateRoster, appendChat, setMyId, setSendChat, getRosterIds } from "./chat.js";
 
+
+
+let _lastTs = 0;
+function nextTs() {
+  const t = Date.now();
+  _lastTs = t <= _lastTs ? _lastTs + 1 : t; // строго возрастающий
+  return _lastTs;
+}
+
 /* =========================================================================
    DOM
    ========================================================================= */
@@ -159,6 +168,7 @@ async function renegotiate(remoteId, pc, opts = {}) {
             to: remoteId,
             sdp: pc.localDescription.sdp,
             sdpType: pc.localDescription.type,
+            ts: nextTs(),
           }));
         }
       } catch (e) {
@@ -233,7 +243,7 @@ function waitForSignalingState(pc, desired = "stable", timeoutMs = 2500) {
 
     if (selfMuteBtn) {
       selfMuteBtn.setAttribute("aria-pressed", selfMuted);
-      selfMuteBtn.textContent = selfMuted ? "🔊 Включить микрофон" : "🔇 Вы заглушены";
+      selfMuteBtn.textContent = selfMuted ? "🔊 Включить микрофон" : "🔇 Вас Слышно, нажмите чтобы заглушить";
       selfMuteBtn.classList.toggle("danger", !selfMuted);
       selfMuteBtn.classList.toggle("primary", selfMuted);
     }
@@ -559,6 +569,7 @@ function makePC(remoteId) {
           sdpMid: e.candidate.sdpMid,
           sdpMLineIndex: e.candidate.sdpMLineIndex,
         },
+        ts: nextTs(),
       }));
     }
   };
@@ -795,6 +806,7 @@ async function onWSMessage(ev) {
           to: from,
           sdp: pc.localDescription.sdp,
           sdpType: pc.localDescription.type,
+          ts: nextTs(),
         }));
       }
 
@@ -1011,7 +1023,7 @@ const Safety = (() => {
     try {
       const ids = (getRosterIds?.() || []).filter(pid => pid && pid !== myId);
       for (const pid of ids) {
-        ws && ws.send(JSON.stringify({ type: "safety-ok", to: pid, about: id }));
+        ws && ws.send(JSON.stringify({ type: "safety-ok", to: pid, about: id, ts: nextTs() }));
       }
     } catch {}
     toast("Собеседник " + (id.slice(0,6)) + " подтверждён");
@@ -1315,7 +1327,8 @@ const E2E = (() => {
   function announceToAll() {
     const ids = (getIds() || []).filter((id) => id && id !== myIdRef);
     for (const pid of ids) {
-      wsSend({ type: "key", to: pid, pub: b64(myPubRaw) });
+      wsSend({ type: "key", to: pid, pub: b64(myPubRaw), ts: nextTs() });
+
     }
   }
 
@@ -1332,7 +1345,8 @@ const E2E = (() => {
       peerFp.set(from, fp);
       if (typeof onPeerFp === "function") onPeerFp(from, fp);
 
-      wsSend({ type: "key", to: from, pub: b64(myPubRaw) });
+      wsSend({ type: "key", to: from, pub: b64(myPubRaw), ts: nextTs() });
+
     } catch (e) {
       console.warn("[E2E] derive failed from", from, e);
     }
@@ -1342,7 +1356,7 @@ const E2E = (() => {
     const msg = (text || "").trim();
     if (!msg) return;
     const ids = (getIds() || []).filter((id) => id && id !== myIdRef);
-    const now = Date.now();
+    const now = nextTs();
 
     for (const pid of ids) {
       try {
