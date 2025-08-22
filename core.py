@@ -277,6 +277,13 @@ def _is_browser(request) -> bool:
     return any(m in ua for m in markers)
 
 async def http_ws(request):
+    # ── В продакшене принимаем апгрейд только по WSS/HTTPS ───────────
+    PROD = os.environ.get("PROD") == "1"
+    is_secure = request.secure or (request.headers.get("X-Forwarded-Proto", "").lower() in ("https", "wss"))
+    if PROD and not is_secure:
+        log.warning("[WS] insecure WS in PROD from %s", request.remote)
+        return web.Response(status=400, text="WSS required in production")
+
     # ── Origin whitelist ─────────────────────────────────────────────
     origin = request.headers.get("Origin")
     if ALLOWED_ORIGINS and origin not in ALLOWED_ORIGINS:
@@ -317,7 +324,15 @@ async def http_ws(request):
         await ws_tmp.close()
         return ws_tmp
 
-    # ── Лимит вместимости ────────────────────────────────────────────
+    # ── Лимит одновременных подключений с одного IP (базовая защита) ─
+    ip = (request.headers.get("X-Forwarded-For", request.remote or "unknown").split(",")[0].strip())
+    max_per_ip = int(os.environ.get("MAX_WS_PER_IP", "3"))
+    conns_from_ip = sum(1 for _pid, _ws in ROOM["peers"].items() if getattr(_ws, "_ip", "") == ip)
+    if conns_from_ip >= max_per_ip:
+        log.warning("[WS] too many connections from %s", ip)
+        return web.Response(status=429, text="Too Many Connections from this IP")
+
+    # ── Лимит вместимости комнаты ────────────────────────────────────
     if len(ROOM["peers"]) >= MAX_PEERS:
         ws_tmp = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_MSG_SIZE)
         await ws_tmp.prepare(request)
@@ -338,6 +353,7 @@ async def http_ws(request):
     # 2.1: привязка «room» к WS-сессии + заготовка peer id
     ws._room_token = matched_item or request.query.get("t", "") or ROOM_TOKEN or "default"
     ws._peer_id = None
+    ws._ip = ip  # сохраняем IP для подсчёта активных коннектов с этого адреса
 
     # ── Регистрация пира ─────────────────────────────────────────────
     pid = uuid.uuid4().hex
@@ -412,7 +428,6 @@ async def http_ws(request):
             sender_id = getattr(ws, "_peer_id", "")
             ts_val = data.get("ts", 0)
             if not validate_ts(room, sender_id, ts_val):
-                # log.debug("[anti-replay] drop %s from %s: bad ts=%r", typ, sender_id[:6], ts_val)
                 continue
 
             if typ == "ice":

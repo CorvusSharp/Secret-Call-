@@ -375,9 +375,22 @@ function initWS() {
     return;
   }
 
+  // Определяем PROD-режим (через window.PROD или <meta name="env" content="prod">)
+  const PROD = (window.PROD === true) || (document.querySelector('meta[name="env"]')?.content === "prod");
+
+  // В проде запрещаем незащищённые схемы (стр. должна быть по HTTPS → WS только WSS)
+  if (PROD) {
+    if (location.protocol !== "https:") {
+      setState("Требуется HTTPS (prod)", "error");
+      toast("В продакшене страница должна открываться по HTTPS", "error");
+      ws = null;
+      return;
+    }
+  }
+
   const scheme = (location.protocol === "https:") ? "wss://" : "ws://";
-  const url = scheme + location.host + "/ws"; // ⬅️ без ?t=
-  ws = new WebSocket(url, ["token." + token]); // ⬅️ только subprotocol
+  const url = scheme + location.host + "/ws"; // без ?t= — токен только как subprotocol
+  ws = new WebSocket(url, ["token." + token]);
 
   ws.onopen = () => setState("Соединение установлено", "ok");
   ws.onclose = (e) => {
@@ -397,6 +410,7 @@ function initWS() {
     await E2E.send(text);
   });
 }
+
 
 async function waitWsOpen(timeoutMs = 6000) {
   if (ws && ws.readyState === WebSocket.OPEN) return;
@@ -487,18 +501,26 @@ function removePeerUI(id) {
 
 /* ---- RTCPeerConnection c relay-only TURN (fallback на STUN для отладки) ---- */
 function makePC(remoteId) {
-  // читаем TURN из meta или глобалов
   const turnUrl = document.querySelector('meta[name="turns-url"]')?.content || window.TURNS_URL || "";
   const turnUser = document.querySelector('meta[name="turns-user"]')?.content || window.TURNS_USER || "";
   const turnPass = document.querySelector('meta[name="turns-pass"]')?.content || window.TURNS_PASS || "";
 
   let pc;
+
+  // В проде запрещаем STUN-fallback: без TURN — не соединяемся
+  const PROD = (window.PROD === true) || (document.querySelector('meta[name="env"]')?.content === "prod");
+  if (PROD && !turnUrl) {
+    toast("TURN не настроен — соединение запрещено в продакшене", "error");
+    throw new Error("TURN required in PROD");
+  }
+
   if (turnUrl) {
     const iceServers = [{ urls: [turnUrl], username: turnUser, credential: turnPass }];
     pc = new RTCPeerConnection({ iceServers, iceTransportPolicy: "relay" });
   } else {
-    // безопасный fallback для локальной отладки
+    // dev-режим: позволим STUN, но предупредим о раскрытии IP
     console.warn("[RTC] TURN не задан — используем STUN для тестов (IP будут видны).");
+    toast("Dev-режим: STUN. Ваш IP виден участникам.", "warn");
     const iceServers = [{ urls: ["stun:stun.l.google.com:19302"] }];
     pc = new RTCPeerConnection({ iceServers, iceTransportPolicy: "all" });
   }
@@ -758,26 +780,26 @@ async function onWSMessage(ev) {
   }
 
   // подтверждение сверки кода безопасности
-  if (m.type === "safety-ok" && m.from) {
-      // m.about — кого подтвердили; если сервер старый и не присылает, считаем, что подтвердили отправителя
-      const about = m.about || m.from;
-      Safety.onPublicConfirmed(m.from, about);
+    if (m.type === "safety-ok") {
+      // ожидаем поля: by, about, ts, mac; для совместимости берём from/to
+      const by = m.by || m.from;
+      const about = m.about || m.to;
+      const ts = m.ts;
+      const mac = m.mac;
+
+      // Доверяем и засчитываем ТОЛЬКО подтверждения «про меня» с валидным MAC
+      if (about === myId && by && typeof mac === "string") {
+        await Safety.onPublicConfirmed(by, about, ts, mac);
+        return;
+      }
+
+      // Для сторонних подтверждений — просто информируем (на логику mute не влияет)
+      if (by && about) {
+        const who = (by || "").slice(0,6), whom = (about || "").slice(0,6);
+        toast(`(инфо) ${who} подтвердил ${whom}`);
+      }
       return;
     }
-
-  if (m.type === "peer-joined") {
-    if (m.id !== myId) {
-      // этот peer заново в комнате — подтверждения с ним больше недействительны
-      Safety.resetPeer(m.id);
-
-      if (!document.getElementById("peer-" + m.id)) addPeerUI(m.id, null);
-      if (joined) maybeCall(m.id);
-      E2E.onRosterUpdate();
-      toast("Кто-то подключился");
-      Safety.enforceMuteIfUnverified();
-    }
-    return;
-  }
 
   if (m.type === "offer") {
     const from = m.from;
@@ -912,25 +934,26 @@ async function onWSMessage(ev) {
 /* =========================================================================
    Safety Codes (минимальный UX)
    ========================================================================= */
+/* =========================================================================
+   Safety Codes (подтверждения безопасности) с криптоподписью
+   ========================================================================= */
 const Safety = (() => {
   // peers: id -> { fpHex, confirmedByMe: bool, confirmedByPeer: bool }
   const peers = new Map();
 
-  // Публичные подтверждения: aboutId -> Set<byId>
-  const confirmations = new Map();
+  // Публичный список «кто кого подтвердил» — чисто информативно для UI.
+  // На логику mute/unmute НЕ влияет (см. ниже).
+  const confirmations = new Map(); // aboutId -> Set<byId>
 
   let myFp = null;
-
+  let _prevAllOk = false;
   function setMyFingerprint(fpHex) {
     const changed = (myFp && fpHex && myFp !== fpHex);
     myFp = fpHex;
     const el = document.getElementById("my-fp");
     if (el) el.textContent = "Мой код безопасности: " + fpHex;
 
-    if (changed) {
-      // новый fingerprint -> все старые подтверждения недействительны
-      resetAllForNewSession();
-    }
+    if (changed) resetAllForNewSession();
   }
 
   function ensurePeerUIBits(id) {
@@ -1007,52 +1030,73 @@ const Safety = (() => {
     enforceMuteIfUnverified();
   }
 
-  // Я подтверждаю peer "id"
-  function confirmPeer(id) {
+  // Локальное подтверждение (только по клику пользователя)
+  async function confirmPeer(id) {
     const s = peers.get(id) || {};
     if (!s.fpHex) return;
 
+    // 1) локально отмечаем "я подтвердил"
     s.confirmedByMe = true;
     peers.set(id, s);
-
     updateConfirmButton(id);
-    addPublicConfirmation(myId, id);
     renderConfirmations(id);
 
-    // Рассылаем всем публичное подтверждение
+    // 2) отправляем подписанное публичное подтверждение адресно КАЖДОМУ peer
+    //    Примечание: подпись проверяемо валидна только для тех, с кем у нас есть общий ключ.
     try {
       const ids = (getRosterIds?.() || []).filter(pid => pid && pid !== myId);
+      const ts = nextTs();
+      // подпись строим поверх "by|about|ts"
+      const payload = `${myId}|${id}|${ts}`;
       for (const pid of ids) {
-        ws && ws.send(JSON.stringify({ type: "safety-ok", to: pid, about: id, ts: nextTs() }));
+        const mac = await E2E.signSafety(payload, pid); // HMAC от пары (я ↔ pid)
+        ws && ws.send(JSON.stringify({
+          type: "safety-ok",
+          to: pid,
+          by: myId,
+          about: id,
+          ts,
+          mac
+        }));
       }
-    } catch {}
+    } catch (e) {
+      console.warn("[Safety] send signed safety-ok failed:", e);
+    }
+
     toast("Собеседник " + (id.slice(0,6)) + " подтверждён");
     enforceMuteIfUnverified();
   }
 
-  // Публичная фиксация: byId подтвердил aboutId
-  function onPublicConfirmed(byId, aboutId) {
+  // Публичная фиксация («by подтвердил about») — доверяем ТОЛЬКО если about === myId и подпись валидна
+  async function onPublicConfirmed(byId, aboutId, ts, mac) {
+    // 1) если это подтверждение "про меня", попробуем верифицировать MAC пары (byId ↔ me)
+    if (aboutId === myId && typeof mac === "string") {
+      try {
+        const ok = await E2E.verifySafety(`${byId}|${aboutId}|${ts}`, mac, byId);
+        if (ok) {
+          const s = peers.get(byId) || {};
+          s.confirmedByPeer = true; // он подтвердил МЕНЯ
+          peers.set(byId, s);
+          updateConfirmButton(byId);
+        } else {
+          console.warn("[Safety] invalid MAC for safety-ok from", byId);
+        }
+      } catch (e) {
+        console.warn("[Safety] MAC verify error:", e);
+      }
+    }
+
+    // 2) UI-индикатор «кто кого подтвердил» можно показать, но на mute/unmute не влияет
     addPublicConfirmation(byId, aboutId);
-
-    if (aboutId === myId) {
-      const s = peers.get(byId) || {};
-      s.confirmedByPeer = true;
-      peers.set(byId, s);
-      updateConfirmButton(byId);
-    }
-    if (byId === myId) {
-      const s = peers.get(aboutId) || {};
-      s.confirmedByMe = true;
-      peers.set(aboutId, s);
-      updateConfirmButton(aboutId);
-    }
-
     renderConfirmations(aboutId);
+
+    // 3) уведомление
     if (byId !== myId) {
-    const who = getDisplayName(byId);
-    const whom = getDisplayName(aboutId);
-    toast(`Пользователь ${who} подтвердил пользователя ${whom}`);
-}
+      const who = getDisplayName(byId);
+      const whom = getDisplayName(aboutId);
+      toast(`Пользователь ${who} подтвердил пользователя ${whom}`);
+    }
+
     enforceMuteIfUnverified();
   }
 
@@ -1061,17 +1105,13 @@ const Safety = (() => {
     confirmations.get(aboutId).add(byId);
   }
 
-  // Очистка/нормализация по текущему составу комнаты
   function pruneToCurrentRoster() {
     const idsNow = (getRosterIds?.() || []).filter(id => id && id !== myId);
     const setNow = new Set(idsNow);
 
-    // удалить ушедших из peers
     for (const id of Array.from(peers.keys())) {
       if (!setNow.has(id)) peers.delete(id);
     }
-
-    // удалить ушедших из подтверждений
     for (const [aboutId, bySet] of Array.from(confirmations.entries())) {
       if (!setNow.has(aboutId)) {
         confirmations.delete(aboutId);
@@ -1081,8 +1121,6 @@ const Safety = (() => {
         if (!setNow.has(byId)) bySet.delete(byId);
       }
     }
-
-    // пересчитать UI остальным
     for (const id of idsNow) {
       updateConfirmButton(id);
       renderConfirmations(id);
@@ -1102,7 +1140,6 @@ const Safety = (() => {
     const liveSet = new Set(idsNow);
 
     const raw = confirmations.get(aboutId) || new Set();
-    // показываем только живых
     const set = new Set([...raw].filter(byId => liveSet.has(byId)));
 
     const count = set.size;
@@ -1125,9 +1162,7 @@ const Safety = (() => {
     }
   }
 
-  // ОПРЕДЕЛЕНИЕ «все взаимно подтверждены»
-  // Условие для моего клиента: для каждого живого peer:
-  //   peers[id].confirmedByMe && peers[id].confirmedByPeer === true
+  // «Все взаимно подтверждены» (для меня): для каждого peer — confirmedByMe && confirmedByPeer
   function bothConfirmed(id) {
     const s = peers.get(id) || {};
     return !!(s.confirmedByMe && s.confirmedByPeer);
@@ -1142,51 +1177,56 @@ const Safety = (() => {
     return true;
   }
 
-  // Автоматическое управление mute
+  // ВАЖНО: Safety больше НЕ включает микрофон сам.
+  // Он только запрещает голос/чат до подтверждения.
+// Автоматическое управление mute:
+  // - Пока НЕ все взаимно подтверждены → форсируем mute
+  // - Как только произошло ВПЕРВЫЕ «все подтверждены» → один раз включаем микрофон
+  //   (дальше пользователь может вручную заглушить — мы больше не вмешиваемся)
   function enforceMuteIfUnverified() {
     const ok = isEveryoneConfirmed();
 
-    // чат
+    // чат-доступ в зависимости от подтверждения
     const chatInput = document.getElementById("chat-input");
     const chatSend  = document.getElementById("chat-send");
     if (chatInput) chatInput.disabled = !ok;
     if (chatSend)  chatSend.disabled  = !ok;
 
     if (!ok) {
-      // принудительный mute (но не меняем userMuted)
+      // режим «не все подтверждены»: держим mute и помечаем состояние
       if (!selfMuted) setSelfMuted(true, "Микрофон отключён: не все подтвердили код шифрования", "safety");
       document.getElementById("state")?.setAttribute("data-status", "warn");
+      _prevAllOk = false;  // сбрасываем — чтобы при следующем «ок» сработало авто-включение
       return;
     }
 
-    // стало ок: авто-включаем только если mute был НЕ пользовательским
-    if (ok && selfMuted && !userMuted) {
-      setSelfMuted(false, "", "safety");
-    }
+    // здесь ok === true
     document.getElementById("state")?.setAttribute("data-status", "ok");
+
+    // Впервые перешли в состояние «все подтверждены» → авто-включаем микрофон (однократно)
+    if (!_prevAllOk) {
+      if (selfMuted) {
+        setSelfMuted(false, "Все взаимно подтверждены — микрофон включён автоматически", "safety");
+      }
+      _prevAllOk = true;
+    }
+
+    // если пользователь затем вручную выключит микрофон — мы не будем включать его снова,
+    // пока состояние «все подтверждены» не сменится на «не подтверждены» и обратно
   }
 
   function resetPeer(peerId) {
-  // удалить локальные флаги
-  peers.delete(peerId);
-
-  // удалить публичные подтверждения «про него» и «им»
-  confirmations.delete(peerId);
-  for (const [, bySet] of confirmations) {
-    bySet.delete(peerId);
+    peers.delete(peerId);
+    confirmations.delete(peerId);
+    for (const [, bySet] of confirmations) bySet.delete(peerId);
+    forcePendingButton(peerId);
+    renderConfirmations(peerId);
+    enforceMuteIfUnverified();
   }
 
-  // привести UI к исходному «Подтвердить»
-  forcePendingButton(peerId);
-  renderConfirmations(peerId);
-  enforceMuteIfUnverified();
-}
-
-// Полный сброс подтверждений при новой сессии (hello)
   function resetAllForNewSession() {
     peers.clear();
     confirmations.clear();
-
     const ids = (getRosterIds?.() || []).filter(id => id && id !== myId);
     for (const id of ids) {
       forcePendingButton(id);
@@ -1195,7 +1235,6 @@ const Safety = (() => {
     enforceMuteIfUnverified();
   }
 
-  // Вспомогательная: привести кнопку к «ожидает подтверждения»
   function forcePendingButton(peerId) {
     const root = document.getElementById("peer-" + peerId);
     if (!root) return;
@@ -1215,27 +1254,25 @@ const Safety = (() => {
   }
 
   function getDisplayName(id) {
-  // пытаемся взять имя из DOM:
-  const el = document.querySelector(`#peer-${id} .peer__name`);
-  const nameFromDom = el?.textContent?.trim();
-  if (nameFromDom) return nameFromDom;
-  // запасной вариант — короткий id
-  return id ? id.slice(0, 6) : "неизвестно";
-}
+    const el = document.querySelector(`#peer-${id} .peer__name`);
+    const nameFromDom = el?.textContent?.trim();
+    return nameFromDom || (id ? id.slice(0, 6) : "неизвестно");
+  }
 
   return {
     setMyFingerprint,
     setPeerFingerprint,
-    confirmPeer,           // опционально на экспорт
-    onPublicConfirmed,
+    confirmPeer,                // локальный клик
+    onPublicConfirmed,          // обработка входящих safety-ok
     onRosterChanged,
     enforceMuteIfUnverified,
     updateConfirmButton,
     isEveryoneConfirmed,
-    resetPeer,               // ⬅️ новое
-    resetAllForNewSession, 
+    resetPeer,
+    resetAllForNewSession,
   };
 })();
+
 /* =========================================================================
    E2E модуль (ECDH P-256 → AES-GCM) + Fingerprint (SHA-256(pub))
    ========================================================================= */
@@ -1251,7 +1288,10 @@ const E2E = (() => {
   let myPubRaw = null;      // ArrayBuffer (raw P-256 public, 65 bytes)
   let myFpHex = null;       // "aa:bb:..."
   const peerFp = new Map(); // id -> "aa:bb:..."
-  const aesForPeer = new Map(); // peerId -> CryptoKey (AES-GCM)
+
+  // Ключи на пару «Я ↔ Peer»
+  const aesForPeer = new Map(); // id -> CryptoKey (AES-GCM)
+  const macForPeer = new Map(); // id -> CryptoKey (HMAC-SHA256)
 
   const enc = new TextEncoder();
   const dec = new TextDecoder();
@@ -1289,15 +1329,36 @@ const E2E = (() => {
     myFpHex = await fpFromRaw(myPubRaw);
   }
 
-  async function deriveAES(peerPubRawBuf) {
+  // HKDF: из общего секрета → AES и HMAC
+  async function derivePair(peerId, peerPubRawBuf) {
+    // общий секрет (сырой)
     const peerPub = await crypto.subtle.importKey("raw", peerPubRawBuf, { name: "ECDH", namedCurve: "P-256" }, false, []);
-    return await crypto.subtle.deriveKey(
-      { name: "ECDH", public: peerPub },
-      myPriv,
+    const sharedBits = await crypto.subtle.deriveBits({ name: "ECDH", public: peerPub }, myPriv, 256);
+    const sharedKey = await crypto.subtle.importKey("raw", sharedBits, "HKDF", false, ["deriveKey"]);
+
+    // соль и info детерминированы: зависят от упорядоченной пары id
+    const [a, b] = [myIdRef, peerId].sort();
+    const salt = enc.encode("sc-v1-hkdf-salt");
+    const infoAES = enc.encode(`sc-v1|aes|${a}|${b}`);
+    const infoMAC = enc.encode(`sc-v1|mac|${a}|${b}`);
+
+    const aesKey = await crypto.subtle.deriveKey(
+      { name: "HKDF", hash: "SHA-256", salt, info: infoAES },
+      sharedKey,
       { name: "AES-GCM", length: 256 },
       false,
       ["encrypt", "decrypt"]
     );
+    const macKey = await crypto.subtle.deriveKey(
+      { name: "HKDF", hash: "SHA-256", salt, info: infoMAC },
+      sharedKey,
+      { name: "HMAC", hash: "SHA-256", length: 256 },
+      false,
+      ["sign", "verify"]
+    );
+
+    aesForPeer.set(peerId, aesKey);
+    macForPeer.set(peerId, macKey);
   }
 
   function wsSend(obj) {
@@ -1328,7 +1389,6 @@ const E2E = (() => {
     const ids = (getIds() || []).filter((id) => id && id !== myIdRef);
     for (const pid of ids) {
       wsSend({ type: "key", to: pid, pub: b64(myPubRaw), ts: nextTs() });
-
     }
   }
 
@@ -1338,13 +1398,15 @@ const E2E = (() => {
     if (!from || from === myIdRef) return;
     try {
       const raw = unb64(msg.pub);
-      const key = await deriveAES(raw);
-      aesForPeer.set(from, key);
+
+      // Вычисляем пары ключей для этой peer-связки
+      await derivePair(from, raw);
 
       const fp = await fpFromRaw(raw);
       peerFp.set(from, fp);
       if (typeof onPeerFp === "function") onPeerFp(from, fp);
 
+      // Ответим своим пабликом (вдруг у него нас нет)
       wsSend({ type: "key", to: from, pub: b64(myPubRaw), ts: nextTs() });
 
     } catch (e) {
@@ -1395,7 +1457,32 @@ const E2E = (() => {
   function getMyFingerprint() { return myFpHex; }
   function getPeerFingerprint(id) { return peerFp.get(id) || null; }
 
-  return { attach, onRosterUpdate, onKey, onCipher, send, getMyFingerprint, getPeerFingerprint };
+  // Подпись «safety-ok»: HMAC-SHA256 по строке payload
+  async function signSafety(payload, peerIdForMac) {
+    const macKey = macForPeer.get(peerIdForMac);
+    if (!macKey) {
+      // нет ключа — попросим key-обмен
+      wsSend({ type: "key", to: peerIdForMac, pub: b64(myPubRaw), ts: nextTs() });
+      throw new Error("no MAC key yet for peer " + peerIdForMac);
+    }
+    const sig = await crypto.subtle.sign("HMAC", macKey, enc.encode(payload));
+    return b64(sig);
+  }
+
+  // Проверка подписи для входящего safety-ok.
+  // Проверяем ТОЛЬКО когда about === myId (то есть это подтверждение «про меня»)
+  async function verifySafety(payload, b64sig, fromPeerId) {
+    const macKey = macForPeer.get(fromPeerId);
+    if (!macKey) return false;
+    const sig = unb64(b64sig);
+    return await crypto.subtle.verify("HMAC", macKey, sig, enc.encode(payload));
+  }
+
+  return {
+    attach, onRosterUpdate, onKey, onCipher, send,
+    getMyFingerprint, getPeerFingerprint,
+    signSafety, verifySafety
+  };
 })();
 
 /* =========================================================================
