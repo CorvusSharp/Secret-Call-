@@ -41,10 +41,10 @@
         <button id="settings" class="btn subtle" title="Сетевые настройки (STUN)" aria-pressed="false">⚙︎</button>
       </div>
 
-      <!-- Кнопка мута себя -->
+      <!-- Кнопка мута себя: уменьшенная и без эмодзи по умолчанию -->
       <div class="row" id="self-mute-row" style="display: none;">
-        <button id="self-mute" class="btn danger" aria-pressed="false">
-          <span class="btn__label">🔇 Вы заглушены</span>
+        <button id="self-mute" class="btn subtle micro" aria-pressed="false">
+          <span class="btn__label">Микрофон</span>
         </button>
       </div>
 
@@ -66,6 +66,9 @@
         </div>
       </div>
 
+      <!-- Код безопасности (safety code / fingerprint) -->
+      <div id="my-fp" class="muted" style="font:12px/1.2 ui-monospace,monospace"></div>
+
       <!-- Контейнер пиров -->
       <div id="peers" class="peers-grid"></div>
 
@@ -85,7 +88,7 @@
       <details class="help">
         <summary>Подсказки</summary>
         <ul>
-            <li>Кнопка <b>Вы заглушены</b> отключает ваш микрофон для всех участников.</li>
+            <li>Кнопка <b>Микрофон</b> отключает ваш микрофон для всех участников.</li>
             <li>Ползунок громкости управляет только вашими колонками.</li>
             <li>Кнопка <b>Mute</b> глушит звук конкретного участника у вас.</li>
             <li>Если комната переполнена — появится окно с пояснением.</li>
@@ -107,7 +110,7 @@
       <div class="peer__hdr">
         <span class="peer__name"></span>
         <div class="peer__actions">
-          <button class="btn micro mute" aria-pressed="false">Mute</button>
+          <button class="btn micro mute" aria-pressed="false" aria-label="Отключить звук участника">Mute</button>
         </div>
       </div>
       <audio autoplay playsinline></audio>
@@ -155,4 +158,3 @@
   <script type="module" src="/app.js"></script>
 </body>
 </html>
-
