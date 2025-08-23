@@ -87,7 +87,7 @@ SecureCall — это экспериментальный анонимный ме
 pip install -r requirements.txt
 
 # Запустить сервер (2 пира)
-python -m core
+python ./main.py
 
 # В браузере: открыть http://localhost:8790/
 ```
